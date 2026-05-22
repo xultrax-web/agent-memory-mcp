@@ -97,10 +97,29 @@ if (!v.valid) throw new Error(v.reason);
 
 HMAC key lives at `<MEMORY_DIR>/.keyring/hmac-key` · 32 random bytes · mode `0600`. v0.11.3 wires receipts into `delete_memory` + other destructive tools and adds the `check_action` MCP tool.
 
+### `audit` command (v0.11.4)
+
+Daily operational health report for the rule store:
+
+```bash
+agent-memory audit          # pretty colored terminal output
+agent-memory audit --json   # structured JSON for tooling
+```
+
+Surfaces:
+
+- Rule count broken down by severity (hard / soft / unspecified)
+- **Stale rules** · `last_verified` > 90 days ago, or never verified
+- **Pattern conflicts** · two rules sharing an `enforce_on` category AND an identical regex in their `matches` arrays
+- **Recent denials** · `check_action` calls that blocked an action (helps spot over-aggressive rules)
+- **Unreceipted destructive ops** · `delete_memory` calls that bypassed the receipt path (back-compat in v0.11.x · v0.12 will remove the path)
+
+The `healthy` flag is true iff no stale rules, no conflicts, no unreceipted ops in the recent log.
+
 ### Roadmap for the v0.11.x series:
 
-- `check_action` tool · deterministic rule matching · optional Sampling enrichment where clients support it · issues Compliance Receipts when proposed action passes
-- `audit` command · rule conflicts · staleness · receipt-denial log
+- Compliance Receipt Protocol 1.0 spec doc on GitHub so other MCP servers can adopt the pattern
+- Sampling-enriched Tier-2 `check_action` for clients that support it
 
 ---
 

@@ -272,6 +272,21 @@ function parseStringArray(input: unknown): string[] | undefined {
   return out.length > 0 ? out : undefined;
 }
 
+/**
+ * js-yaml (gray-matter's parser) auto-coerces ISO-8601 date strings into
+ * JavaScript Date objects unless quoted. Normalize to YYYY-MM-DD string
+ * regardless of whether the YAML gave us a string or a Date.
+ */
+function parseLastVerified(input: unknown): string | undefined {
+  if (input instanceof Date) {
+    return input.toISOString().slice(0, 10);
+  }
+  if (typeof input === "string" && /^\d{4}-\d{2}-\d{2}$/.test(input)) {
+    return input;
+  }
+  return undefined;
+}
+
 export function readMemory(name: string): Memory | null {
   const fp = memoryFilePath(name);
   if (!existsSync(fp)) return null;
@@ -291,10 +306,7 @@ export function readMemory(name: string): Memory | null {
     applies_when: parseStringArray(fm.applies_when),
     matches: parseStringArray(fm.matches),
     enforce_on: parseStringArray(fm.enforce_on),
-    last_verified:
-      typeof fm.last_verified === "string" && /^\d{4}-\d{2}-\d{2}$/.test(fm.last_verified)
-        ? fm.last_verified
-        : undefined,
+    last_verified: parseLastVerified(fm.last_verified),
   };
 }
 
@@ -1864,7 +1876,7 @@ function toolCheckAction(args: Record<string, unknown>): string {
       rules_evaluated,
     };
     logEvent("check_action_denied", {
-      action,
+      proposed_action: action,
       action_type: actionType,
       hard_count: hard.length,
       soft_count: soft.length,
@@ -1888,7 +1900,7 @@ function toolCheckAction(args: Record<string, unknown>): string {
     rules_evaluated,
   };
   logEvent("check_action_approved", {
-    action,
+    proposed_action: action,
     action_type: actionType,
     receipt_id: receipt.id,
     soft_count: soft.length,
@@ -1912,6 +1924,263 @@ function parseReceiptArg(input: unknown): ComplianceReceipt | null {
     }
   }
   return null;
+}
+
+// -------------------------------------------------------------
+// audit · v0.11.4 · daily-rhythm operational health command
+// -------------------------------------------------------------
+//
+// Surfaces what's working and what's drifting in the rule store:
+//   - Rule count, broken down by severity
+//   - Stale rules (last_verified > 90 days ago, or never verified)
+//   - Pattern conflicts (two rules sharing an enforce_on category AND
+//     an identical regex in their matches arrays · likely contradiction)
+//   - Recent check_action denials (the system blocked something — was
+//     that the right call? is a rule too aggressive?)
+//   - Recent unreceipted destructive ops (back-compat path · v0.12 will
+//     remove it but for v0.11.x audit just flags them)
+
+const STALE_THRESHOLD_DAYS = 90;
+const AUDIT_EVENT_TAIL = 50;
+
+export interface AuditRulesSummary {
+  total: number;
+  hard: number;
+  soft: number;
+  no_severity: number;
+}
+
+export interface StaleRule {
+  name: string;
+  last_verified: string | null;
+  age_days: number | null;
+  description: string;
+}
+
+export interface RuleConflict {
+  rule_a: string;
+  rule_b: string;
+  shared_pattern: string;
+  shared_enforce_on: string;
+}
+
+export interface RecentDenial {
+  ts: string;
+  action: string;
+  action_type: string;
+  hard_count: number;
+}
+
+export interface UnreceiptedDelete {
+  ts: string;
+  name: string;
+}
+
+export interface AuditReport {
+  rules: AuditRulesSummary;
+  stale_rules: StaleRule[];
+  pattern_conflicts: RuleConflict[];
+  recent_denials: RecentDenial[];
+  recent_unreceipted_deletes: UnreceiptedDelete[];
+  healthy: boolean;
+}
+
+function summarizeRules(rules: Memory[]): AuditRulesSummary {
+  let hard = 0;
+  let soft = 0;
+  let noSev = 0;
+  for (const r of rules) {
+    if (r.severity === "hard") hard++;
+    else if (r.severity === "soft") soft++;
+    else noSev++;
+  }
+  return { total: rules.length, hard, soft, no_severity: noSev };
+}
+
+function findStaleRules(rules: Memory[], thresholdDays: number): StaleRule[] {
+  const now = Date.now();
+  const stale: StaleRule[] = [];
+  for (const r of rules) {
+    if (!r.last_verified) {
+      stale.push({
+        name: r.name,
+        last_verified: null,
+        age_days: null,
+        description: r.description,
+      });
+      continue;
+    }
+    const verifiedAt = new Date(r.last_verified).getTime();
+    if (Number.isNaN(verifiedAt)) {
+      stale.push({
+        name: r.name,
+        last_verified: r.last_verified,
+        age_days: null,
+        description: r.description,
+      });
+      continue;
+    }
+    const ageDays = Math.floor((now - verifiedAt) / 86400_000);
+    if (ageDays > thresholdDays) {
+      stale.push({
+        name: r.name,
+        last_verified: r.last_verified,
+        age_days: ageDays,
+        description: r.description,
+      });
+    }
+  }
+  return stale;
+}
+
+function findPatternConflicts(rules: Memory[]): RuleConflict[] {
+  const conflicts: RuleConflict[] = [];
+  for (let i = 0; i < rules.length; i++) {
+    const a = rules[i];
+    if (!a.matches || a.matches.length === 0) continue;
+    for (let j = i + 1; j < rules.length; j++) {
+      const b = rules[j];
+      if (!b.matches || b.matches.length === 0) continue;
+
+      // Need overlap in enforce_on (or both empty → universal)
+      const aCategories = a.enforce_on ?? [];
+      const bCategories = b.enforce_on ?? [];
+      const sharedCategories =
+        aCategories.length === 0 || bCategories.length === 0
+          ? ["(universal)"]
+          : aCategories.filter((c) => bCategories.includes(c));
+      if (sharedCategories.length === 0) continue;
+
+      // Need at least one identical pattern · low-false-positive heuristic
+      const sharedPatterns = a.matches.filter((p) => b.matches!.includes(p));
+      if (sharedPatterns.length === 0) continue;
+
+      for (const cat of sharedCategories) {
+        for (const pat of sharedPatterns) {
+          conflicts.push({
+            rule_a: a.name,
+            rule_b: b.name,
+            shared_pattern: pat,
+            shared_enforce_on: cat,
+          });
+        }
+      }
+    }
+  }
+  return conflicts;
+}
+
+function recentDenials(): RecentDenial[] {
+  const records = readEventLog({ tail: AUDIT_EVENT_TAIL, action: "check_action_denied" });
+  return records.map((r) => ({
+    ts: String(r.ts),
+    action: String(r.proposed_action ?? ""),
+    action_type: String(r.action_type ?? ""),
+    hard_count: typeof r.hard_count === "number" ? r.hard_count : 0,
+  }));
+}
+
+function recentUnreceiptedDeletes(): UnreceiptedDelete[] {
+  const records = readEventLog({ tail: AUDIT_EVENT_TAIL, action: "delete_without_receipt" });
+  return records.map((r) => ({
+    ts: String(r.ts),
+    name: String(r.name ?? ""),
+  }));
+}
+
+export function runAudit(): AuditReport {
+  const rules = loadAllRules();
+  const stale = findStaleRules(rules, STALE_THRESHOLD_DAYS);
+  const conflicts = findPatternConflicts(rules);
+  const denials = recentDenials();
+  const unreceipted = recentUnreceiptedDeletes();
+  return {
+    rules: summarizeRules(rules),
+    stale_rules: stale,
+    pattern_conflicts: conflicts,
+    recent_denials: denials,
+    recent_unreceipted_deletes: unreceipted,
+    healthy: stale.length === 0 && conflicts.length === 0 && unreceipted.length === 0,
+  };
+}
+
+function formatAuditPretty(r: AuditReport): string {
+  const lines: string[] = [];
+  lines.push(c(ANSI.bold, "agent-memory audit"));
+  lines.push("");
+  lines.push(
+    `  Rules: ${c(ANSI.bold, String(r.rules.total))}  ` +
+      `(${c(ANSI.red, String(r.rules.hard) + " hard")} · ` +
+      `${c(ANSI.yellow, String(r.rules.soft) + " soft")} · ` +
+      `${r.rules.no_severity} unspecified)`,
+  );
+  lines.push("");
+
+  if (r.stale_rules.length > 0) {
+    lines.push(c(ANSI.yellow, `  ${r.stale_rules.length} stale rule(s):`));
+    for (const s of r.stale_rules) {
+      const age =
+        s.age_days === null
+          ? c(ANSI.dim, "(never verified)")
+          : c(ANSI.dim, `(${s.age_days}d since last_verified)`);
+      lines.push(`    ${s.name}  ${age}`);
+      lines.push(`      ${c(ANSI.dim, s.description)}`);
+    }
+    lines.push("");
+  } else {
+    lines.push(c(ANSI.green, "  All rules verified within 90 days."));
+    lines.push("");
+  }
+
+  if (r.pattern_conflicts.length > 0) {
+    lines.push(c(ANSI.red, `  ${r.pattern_conflicts.length} pattern conflict(s):`));
+    for (const conf of r.pattern_conflicts) {
+      lines.push(
+        `    ${conf.rule_a} <-> ${conf.rule_b}  ` +
+          c(ANSI.dim, `(share pattern '${conf.shared_pattern}' on '${conf.shared_enforce_on}')`),
+      );
+    }
+    lines.push("");
+  } else {
+    lines.push(c(ANSI.green, "  No pattern conflicts detected."));
+    lines.push("");
+  }
+
+  if (r.recent_denials.length > 0) {
+    lines.push(`  Recent denials (${r.recent_denials.length}):`);
+    for (const d of r.recent_denials.slice(-5)) {
+      lines.push(
+        `    ${c(ANSI.dim, d.ts.slice(0, 19))}  ${d.action_type}  ` +
+          c(ANSI.red, `(${d.hard_count} hard violation${d.hard_count === 1 ? "" : "s"})`),
+      );
+      lines.push(`      ${c(ANSI.dim, d.action)}`);
+    }
+    lines.push("");
+  }
+
+  if (r.recent_unreceipted_deletes.length > 0) {
+    lines.push(c(ANSI.yellow, `  ${r.recent_unreceipted_deletes.length} unreceipted delete(s):`));
+    for (const u of r.recent_unreceipted_deletes.slice(-5)) {
+      lines.push(`    ${c(ANSI.dim, u.ts.slice(0, 19))}  ${u.name}`);
+    }
+    lines.push(
+      c(ANSI.dim, `    (v0.11.x back-compat path; v0.12 will require receipts for delete_memory)`),
+    );
+    lines.push("");
+  }
+
+  lines.push(
+    r.healthy
+      ? c(ANSI.green, "  HEALTHY · no action required")
+      : c(ANSI.yellow, "  ATTENTION · review the items above"),
+  );
+  return lines.join("\n");
+}
+
+function toolAudit(args: Record<string, unknown>): string {
+  const json = args.json === true || args.format === "json";
+  const report = runAudit();
+  return json ? JSON.stringify(report, null, 2) : formatAuditPretty(report);
 }
 
 // -------------------------------------------------------------
@@ -2289,7 +2558,7 @@ function actionColor(action: string): string {
 // -------------------------------------------------------------
 
 const server = new Server(
-  { name: "agent-memory", version: "0.11.3" },
+  { name: "agent-memory", version: "0.11.4" },
   { capabilities: { tools: {}, resources: {}, prompts: {} } },
 );
 
@@ -2862,6 +3131,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: { type: "object", properties: {} },
     },
     {
+      name: "audit",
+      description:
+        "v0.11.4 · operational health report for the rule store. Surfaces: rule count by severity, stale rules (last_verified > 90 days or null), pattern conflicts (two rules sharing an enforce_on category AND an identical regex pattern), recent check_action denials, and recent unreceipted destructive ops. " +
+        "Default returns pretty-printed text; pass {format: 'json'} for structured output. " +
+        "Run daily-ish · the report is fast and gives the operator a single view of what's drifting.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          format: {
+            type: "string",
+            enum: ["pretty", "json"],
+            description: "Output format. Default 'pretty' (human-readable colored text).",
+          },
+        },
+      },
+    },
+    {
       name: "check_action",
       description:
         "v0.11.3 · the protocol enforcement point. Pass a proposed action description + its category; the server matches against rule memories (type=rule) and either:\n" +
@@ -2987,6 +3273,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "check_action":
         result = toolCheckAction(args);
         break;
+      case "audit":
+        result = toolAudit(args);
+        break;
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
@@ -3028,6 +3317,7 @@ const CLI_COMMANDS = new Set([
   "list-rules",
   "emit-companions",
   "check-action",
+  "audit",
   "ui",
   "import-claude-code",
   "help",
@@ -3302,6 +3592,10 @@ async function cliMain(command: string, rest: string[]): Promise<number> {
             session_id: flags.session ? String(flags.session) : undefined,
           }) + "\n",
         );
+        return 0;
+      }
+      case "audit": {
+        process.stdout.write(toolAudit({ format: flags.json ? "json" : "pretty" }) + "\n");
         return 0;
       }
       case "ui": {
