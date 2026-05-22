@@ -45,6 +45,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import lockfile from "proper-lockfile";
 
 // -------------------------------------------------------------
@@ -60,7 +61,7 @@ function resolveStorageDir(): string {
   return resolve(process.cwd(), ".agent-memory");
 }
 
-const MEMORY_DIR = resolveStorageDir();
+export const MEMORY_DIR = resolveStorageDir();
 const INDEX_FILE = join(MEMORY_DIR, "MEMORY.md");
 const TRASH_DIR = join(MEMORY_DIR, ".trash");
 const LOCK_FILE = join(MEMORY_DIR, ".lock");
@@ -228,7 +229,7 @@ interface MemoryFrontmatter {
   tags?: string[];
 }
 
-interface Memory {
+export interface Memory {
   name: string;
   description: string;
   type: string;
@@ -245,11 +246,11 @@ const TAG_PATTERN = /^[a-z0-9][a-z0-9_-]{0,40}$/;
 // Wiki-links: [[memory-name]] · names follow SLUG_PATTERN rules
 const WIKI_LINK_PATTERN = /\[\[([a-z0-9][a-z0-9_-]{0,80})\]\]/g;
 
-function memoryFilePath(name: string): string {
+export function memoryFilePath(name: string): string {
   return join(MEMORY_DIR, `${name}.md`);
 }
 
-function readMemory(name: string): Memory | null {
+export function readMemory(name: string): Memory | null {
   const fp = memoryFilePath(name);
   if (!existsSync(fp)) return null;
   const raw = readFileSync(fp, "utf8");
@@ -265,7 +266,7 @@ function readMemory(name: string): Memory | null {
   };
 }
 
-function listMemoryFiles(): string[] {
+export function listMemoryFiles(): string[] {
   if (!existsSync(MEMORY_DIR)) return [];
   return readdirSync(MEMORY_DIR)
     .filter((f) => f.endsWith(".md") && f !== "MEMORY.md")
@@ -688,7 +689,7 @@ function toolRelevantMemories(args: Record<string, unknown>): string {
   return sections.join("\n");
 }
 
-function toolDeleteMemory(args: Record<string, unknown>): string {
+export function toolDeleteMemory(args: Record<string, unknown>): string {
   const name = String(args.name ?? "").trim();
   if (!SLUG_PATTERN.test(name)) throw new Error(`Invalid name "${name}".`);
   const fp = memoryFilePath(name);
@@ -1468,7 +1469,7 @@ function actionColor(action: string): string {
 // -------------------------------------------------------------
 
 const server = new Server(
-  { name: "agent-memory", version: "0.9.0" },
+  { name: "agent-memory", version: "0.10.0" },
   { capabilities: { tools: {}, resources: {}, prompts: {} } },
 );
 
@@ -2056,6 +2057,7 @@ const CLI_COMMANDS = new Set([
   "backlinks",
   "related",
   "sync",
+  "ui",
   "import-claude-code",
   "help",
   "--help",
@@ -2262,6 +2264,13 @@ async function cliMain(command: string, rest: string[]): Promise<number> {
         );
         return 0;
       }
+      case "ui": {
+        // Dynamic import so Ink + React only load when the TUI runs,
+        // keeping cold-start fast for MCP server + every other CLI command.
+        const { runTui } = await import("./tui.js");
+        await runTui();
+        return 0;
+      }
       case "import-claude-code": {
         return importClaudeCode({
           source: flags.source ? String(flags.source) : undefined,
@@ -2320,6 +2329,8 @@ COMMANDS
     sync pull                                Fast-forward pull from remote.
     sync status                              Show local + ahead/behind state.
     sync log [--limit N]                     Recent sync commit history.
+  ui                                       Launch the TUI · browse, filter, search, edit memories
+                                           in a clean terminal interface (Ink-based).
   import-claude-code [--source <path>] [--project <pat>] [--overwrite] [--dry-run]
                                            Walk ~/.claude/projects/*/memory/ and
                                            import each memory into the current store.
@@ -2483,7 +2494,12 @@ async function main(): Promise<void> {
   process.stderr.write(`agent-memory-mcp · storage: ${MEMORY_DIR}\n`);
 }
 
-main().catch((err) => {
-  process.stderr.write(`Fatal: ${err instanceof Error ? err.message : String(err)}\n`);
-  process.exit(1);
-});
+// Only auto-run main() when invoked directly. Importing this file
+// (e.g. from src/tui.tsx) should not trigger the dispatch.
+const isEntryPoint = process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url);
+if (isEntryPoint) {
+  main().catch((err) => {
+    process.stderr.write(`Fatal: ${err instanceof Error ? err.message : String(err)}\n`);
+    process.exit(1);
+  });
+}

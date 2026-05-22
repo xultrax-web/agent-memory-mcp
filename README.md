@@ -272,6 +272,7 @@ agent-memory sync init git@github.com:you/agent-memory.git    # multi-machine se
 agent-memory sync push                         # commit + push local changes
 agent-memory sync pull                         # fast-forward from remote
 agent-memory sync status                       # local + ahead/behind state
+agent-memory ui                                # launch the TUI (browse + edit interactively)
 ```
 
 ### Multi-machine memory (git sync)
@@ -418,6 +419,16 @@ This server is built to be used daily, not to demo well once.
 - **`find_backlinks`** tool + `agent-memory backlinks <name>` CLI — "what links to this".
 - **`find_related`** tool + `agent-memory related <name>` CLI — combines outbound + inbound links, shared tags, type match, and content similarity into a ranked discovery view.
 
+**Shipped in v0.10 · the visual identity (TUI):**
+
+- **`agent-memory ui`** — Ink-based terminal UI for browsing, filtering, searching, and editing memories without leaving the terminal.
+- Type-filter quick-keys (0-4 cycle through all/user/feedback/project/reference)
+- Fuzzy live search with `/`
+- `e` opens the highlighted memory in `$EDITOR` (vim/notepad/nano/whatever) — saves back to disk
+- `d` soft-deletes with `y/n` confirmation
+- Detail pane previews the body of the selected memory
+- Color-coded by type, tag chips inline
+
 **Shipped in v0.9 · the moat — multi-machine memory via git:**
 
 - **`agent-memory sync init <remote-url>`** — convert `.agent-memory/` into a git repo, push to remote.
@@ -429,11 +440,12 @@ This server is built to be used daily, not to demo well once.
 - Per-machine state (`.lock`, `.events.jsonl`, `.trash/`) auto-excluded from sync.
 - Default commit identity injected (`agent-memory@local`) so machines without `git config --global user.email` work without setup.
 
-**Landing in v0.10+:**
+**Landing in v0.11+:**
 
-- TUI / web UI for browsing + editing memories in a clean interface
 - Folder support (`.agent-memory/work/`, `.agent-memory/personal/`)
 - Memory packs for shareable curated bundles
+- Web UI for browser-based memory browsing (companion to the TUI)
+- Auto-context loading (LLM gets relevant memories transparently before each prompt)
 
 ---
 
