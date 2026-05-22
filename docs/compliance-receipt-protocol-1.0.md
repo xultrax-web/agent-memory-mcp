@@ -193,11 +193,57 @@ The reference implementation uses this pattern: `delete_memory` accepts an optio
 
 CRP is designed so multiple MCP servers can honor receipts issued by a coordinator server. To interoperate:
 
-- The coordinator publishes its public verification material (out of scope for v1.0; will be specified in v1.1 with asymmetric signing).
+- The coordinator publishes its public verification material (HMAC shared secret for v1.0, Ed25519 public key for v1.1+).
 - Honoring servers store the verification material and validate receipts against it.
 - Receipts MUST carry sufficient caveats for the honoring server to determine which action the receipt approves.
 
-**v1.0 limitations:** This version uses HMAC, which requires shared secrets. Cross-server adoption in v1.0 is therefore limited to tightly coupled deployments where servers can share a key. v1.1 will define an asymmetric (Ed25519) signing mode for true federation.
+**v1.0 limitations:** v1.0 uses HMAC, which requires a shared secret between issuer and verifier. Cross-server adoption is therefore limited to tightly coupled deployments where servers can pre-share a key. CRP 1.1 (below) defines an asymmetric signing mode that removes this constraint.
+
+## CRP 1.1 · Asymmetric (Ed25519) signing
+
+CRP 1.1 adds Ed25519 asymmetric signing as an alternative to HMAC. The receipt structure is back-compatible: 1.1 receipts carry a `"version": "1.1"` field, 1.0 receipts MAY omit the field (treated as `"1.0"`). The version field is part of the canonical form, so 1.0 and 1.1 receipts with otherwise-identical payloads produce distinct signatures — this prevents version-downgrade attacks.
+
+### Why Ed25519
+
+- **No shared secrets.** Verifiers hold only the issuer's public key. Compromising a verifier doesn't compromise the issuer's signing capability.
+- **Compact.** Ed25519 signatures are 64 bytes (128 hex chars in CRP) — comparable to HMAC-SHA256's 32 bytes.
+- **Fast.** Sign and verify are sub-millisecond on commodity hardware.
+- **Standardized.** RFC 8032. Native Node `crypto` support. Implementations exist in every major language.
+
+### Key management
+
+- Each issuing server generates an Ed25519 keypair on first 1.1 issuance.
+- The private key MUST be stored with access restricted to the server process (mode 0o600 on POSIX).
+- The public key MAY be world-readable (mode 0o644 on POSIX). It is shareable.
+- Servers MUST NOT publish their private keys.
+- Servers SHOULD support key rotation. Active receipts signed with a retired key SHOULD be rejected; a transition period MAY be defined.
+
+### Public key publication
+
+CRP 1.1 does not prescribe a specific public-key publication protocol. RECOMMENDED approaches:
+
+- **CLI export** — issuer runs a command (`agent-memory export-pubkey` in the reference implementation) that prints the PEM-encoded public key for manual distribution.
+- **`.well-known/crp-pubkey.pem`** — issuer serves the PEM at a stable HTTPS URL. Verifiers fetch and cache it. Future CRP versions MAY formalize this convention.
+- **MCP Resource** — issuer exposes the public key as an MCP Resource. Verifiers read it through a federated MCP connection. CRP 1.2 will likely define this transport.
+
+### Validation
+
+Validation of a 1.1 receipt follows the same steps as 1.0 with one change at step 2:
+
+- **Signature check (CRP 1.1)** · Recompute the canonical form (with the `version` field present), then call `crypto_sign_ed25519_verify_detached(signature, canonical, public_key)` using libsodium semantics. Reject on verification failure.
+
+All other validation steps (expiry, rules-version, required caveats) are unchanged.
+
+### Signing-mode selection
+
+A CRP-implementing server SHOULD support both 1.0 and 1.1 modes. The reference implementation selects mode via the `CRP_SIGNING_MODE` environment variable (`hmac` default, `ed25519` opt-in). Verifiers MUST validate the appropriate algorithm based on the receipt's `version` field — not the verifier's preferred mode.
+
+### Reference implementation
+
+- Keypair: generated lazily by `loadOrCreateEd25519Keys()` in `src/index.ts`. Stored at `<MEMORY_DIR>/.keyring/ed25519.priv` (PEM, PKCS#8, mode 0o600) and `<MEMORY_DIR>/.keyring/ed25519.pub` (PEM, SPKI, mode 0o644).
+- Signing: `cryptoSign(null, canonical, privKey)` from Node's `crypto`. The `null` algorithm parameter is Node's API contract for Ed25519 (the signature scheme has no separate digest).
+- Verification: `cryptoVerify(null, canonical, pubKey, signature)`. Returns boolean.
+- CLI: `agent-memory export-pubkey` writes the PEM public key to stdout. Pipe to a file, share with a partnering server.
 
 ## Test vectors
 

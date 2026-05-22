@@ -36,7 +36,17 @@ import {
 import Fuse from "fuse.js";
 import matter from "gray-matter";
 import { spawnSync } from "node:child_process";
-import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import {
+  createHash,
+  createHmac,
+  createPrivateKey,
+  createPublicKey,
+  generateKeyPairSync,
+  randomBytes,
+  sign as cryptoSign,
+  timingSafeEqual,
+  verify as cryptoVerify,
+} from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -1580,7 +1590,18 @@ function toolSaveRule(args: Record<string, unknown>): string {
 
 const KEYRING_DIR = join(MEMORY_DIR, ".keyring");
 const HMAC_KEY_FILE = join(KEYRING_DIR, "hmac-key");
+const ED25519_PRIV_FILE = join(KEYRING_DIR, "ed25519.priv");
+const ED25519_PUB_FILE = join(KEYRING_DIR, "ed25519.pub");
 const RECEIPT_DEFAULT_TTL_SECONDS = 60;
+
+/**
+ * Signing-mode selector. CRP 1.0 = HMAC-SHA256 with shared symmetric secret.
+ * CRP 1.1 = Ed25519 asymmetric · enables cross-server federation (validators
+ * verify with the issuer's public key, no shared secret needed). Set via
+ * the `CRP_SIGNING_MODE` env var. Default stays `hmac` for back-compat.
+ */
+const CRP_SIGNING_MODE: "hmac" | "ed25519" =
+  process.env.CRP_SIGNING_MODE === "ed25519" ? "ed25519" : "hmac";
 
 export interface Caveat {
   /** Caveat kind. Reserved: "action", "session", "scope", "expires_before". Custom kinds are allowed. */
@@ -1600,8 +1621,10 @@ export interface ComplianceReceipt {
   rules_version: string;
   /** Constraints attached to this receipt. Validation requires all required caveats to be present. */
   caveats: Caveat[];
-  /** Hex-encoded HMAC-SHA256 of the canonical form (excluding this field). */
+  /** Hex-encoded signature. HMAC-SHA256 (64 hex chars) for CRP 1.0, Ed25519 (128 hex chars) for CRP 1.1. */
   signature: string;
+  /** Optional CRP version. Absent or "1.0" → HMAC. "1.1" → Ed25519. */
+  version?: "1.0" | "1.1";
 }
 
 function loadOrCreateHmacKey(): Buffer {
@@ -1616,6 +1639,40 @@ function loadOrCreateHmacKey(): Buffer {
   // default to the user, so practically equivalent for our threat model.
   writeFileSync(HMAC_KEY_FILE, key, { mode: 0o600 });
   return key;
+}
+
+/**
+ * Load or lazily create the Ed25519 keypair for CRP 1.1 receipts. Private
+ * key (PEM, mode 0o600) signs · public key (PEM, mode 0o644) verifies and
+ * can be shared with other MCP servers for federation. The public key
+ * is exportable via the `agent-memory export-pubkey` CLI command.
+ */
+function loadOrCreateEd25519Keys(): { privateKeyPem: string; publicKeyPem: string } {
+  if (!existsSync(KEYRING_DIR)) {
+    mkdirSync(KEYRING_DIR, { recursive: true });
+  }
+  if (existsSync(ED25519_PRIV_FILE) && existsSync(ED25519_PUB_FILE)) {
+    return {
+      privateKeyPem: readFileSync(ED25519_PRIV_FILE, "utf8"),
+      publicKeyPem: readFileSync(ED25519_PUB_FILE, "utf8"),
+    };
+  }
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const privPem = privateKey.export({ format: "pem", type: "pkcs8" }) as string;
+  const pubPem = publicKey.export({ format: "pem", type: "spki" }) as string;
+  writeFileSync(ED25519_PRIV_FILE, privPem, { mode: 0o600 });
+  writeFileSync(ED25519_PUB_FILE, pubPem, { mode: 0o644 });
+  return { privateKeyPem: privPem, publicKeyPem: pubPem };
+}
+
+/**
+ * Export the Ed25519 public key (PEM) for sharing with other servers.
+ * Returns null when CRP 1.1 hasn't been initialized yet · the keypair is
+ * created lazily on first Ed25519 receipt issuance.
+ */
+export function exportEd25519PublicKey(): string | null {
+  if (!existsSync(ED25519_PUB_FILE)) return null;
+  return readFileSync(ED25519_PUB_FILE, "utf8");
 }
 
 /**
@@ -1650,18 +1707,63 @@ function canonicalizeReceipt(r: Omit<ComplianceReceipt, "signature">): string {
   const sortedCaveats = [...r.caveats].sort((a, b) =>
     a.type === b.type ? a.value.localeCompare(b.value) : a.type.localeCompare(b.type),
   );
-  return JSON.stringify({
+  // Field ordering is significant for the signed canonical form. The
+  // version field is included only when present so v1.0 and v1.1 receipts
+  // produce distinct signatures (preventing version-downgrade attacks).
+  const base: Record<string, unknown> = {
     id: r.id,
     issued_at: r.issued_at,
     expires_at: r.expires_at,
     rules_version: r.rules_version,
     caveats: sortedCaveats,
-  });
+  };
+  if (r.version) base.version = r.version;
+  return JSON.stringify(base);
 }
 
 function signReceipt(r: Omit<ComplianceReceipt, "signature">): string {
+  const canonical = canonicalizeReceipt(r);
+  if (r.version === "1.1") {
+    const { privateKeyPem } = loadOrCreateEd25519Keys();
+    const privKey = createPrivateKey(privateKeyPem);
+    // Ed25519 signs the raw bytes directly (no separate digest); pass null
+    // as the algorithm per Node's API contract.
+    return cryptoSign(null, Buffer.from(canonical, "utf8"), privKey).toString("hex");
+  }
+  // Default CRP 1.0 · HMAC-SHA256
   const key = loadOrCreateHmacKey();
-  return createHmac("sha256", key).update(canonicalizeReceipt(r)).digest("hex");
+  return createHmac("sha256", key).update(canonical).digest("hex");
+}
+
+function verifySignature(receipt: ComplianceReceipt): boolean {
+  const canonical = canonicalizeReceipt({
+    id: receipt.id,
+    issued_at: receipt.issued_at,
+    expires_at: receipt.expires_at,
+    rules_version: receipt.rules_version,
+    caveats: receipt.caveats,
+    version: receipt.version,
+  });
+  if (receipt.version === "1.1") {
+    try {
+      const { publicKeyPem } = loadOrCreateEd25519Keys();
+      const pubKey = createPublicKey(publicKeyPem);
+      return cryptoVerify(
+        null,
+        Buffer.from(canonical, "utf8"),
+        pubKey,
+        Buffer.from(receipt.signature, "hex"),
+      );
+    } catch {
+      return false;
+    }
+  }
+  // CRP 1.0 · HMAC-SHA256 with constant-time compare
+  const key = loadOrCreateHmacKey();
+  const expected = createHmac("sha256", key).update(canonical).digest();
+  const actual = Buffer.from(receipt.signature, "hex");
+  if (expected.length !== actual.length) return false;
+  return timingSafeEqual(expected, actual);
 }
 
 export interface IssueReceiptOptions {
@@ -1672,8 +1774,15 @@ export interface IssueReceiptOptions {
 }
 
 /**
- * Issue a fresh Compliance Receipt with the given caveats. The receipt
- * is bound to the current rule-store hash; any rule edit invalidates it.
+ * Issue a fresh Compliance Receipt with the given caveats. The receipt is
+ * bound to the current rule-store hash; any rule edit invalidates it.
+ *
+ * Signing mode selected by the `CRP_SIGNING_MODE` env var:
+ *   - `hmac` (default) · CRP 1.0 · HMAC-SHA256 with a 256-bit shared secret
+ *   - `ed25519` · CRP 1.1 · Ed25519 asymmetric · enables cross-server
+ *     federation since validators verify with the issuer's public key
+ *     without sharing any secret. Public key exportable via the
+ *     `agent-memory export-pubkey` CLI command.
  */
 export function issueReceipt(opts: IssueReceiptOptions): ComplianceReceipt {
   const now = Math.floor(Date.now() / 1000);
@@ -1684,6 +1793,7 @@ export function issueReceipt(opts: IssueReceiptOptions): ComplianceReceipt {
     expires_at: now + ttl,
     rules_version: computeRulesVersion(),
     caveats: opts.caveats,
+    ...(CRP_SIGNING_MODE === "ed25519" ? { version: "1.1" as const } : {}),
   };
   return { ...base, signature: signReceipt(base) };
 }
@@ -1710,17 +1820,10 @@ export function validateReceipt(
   receipt: ComplianceReceipt,
   opts: ValidateReceiptOptions = {},
 ): ValidateReceiptResult {
-  // 1. HMAC verification · constant-time compare to avoid timing leaks.
-  const expected = signReceipt({
-    id: receipt.id,
-    issued_at: receipt.issued_at,
-    expires_at: receipt.expires_at,
-    rules_version: receipt.rules_version,
-    caveats: receipt.caveats,
-  });
-  const expectedBuf = Buffer.from(expected, "hex");
-  const actualBuf = Buffer.from(receipt.signature, "hex");
-  if (expectedBuf.length !== actualBuf.length || !timingSafeEqual(expectedBuf, actualBuf)) {
+  // 1. Signature verification · routes to HMAC (CRP 1.0) or Ed25519 (CRP 1.1)
+  //    based on the receipt's version field. Both paths use constant-time
+  //    comparisons internally to avoid timing leaks.
+  if (!verifySignature(receipt)) {
     return { valid: false, reason: "invalid signature" };
   }
 
@@ -2677,7 +2780,7 @@ function actionColor(action: string): string {
 // -------------------------------------------------------------
 
 const server = new Server(
-  { name: "agent-memory", version: "0.12.0" },
+  { name: "agent-memory", version: "0.13.0" },
   { capabilities: { tools: {}, resources: {}, prompts: {} } },
 );
 
@@ -3442,6 +3545,7 @@ const CLI_COMMANDS = new Set([
   "emit-companions",
   "check-action",
   "audit",
+  "export-pubkey",
   "ui",
   "import-claude-code",
   "help",
@@ -3735,6 +3839,14 @@ async function cliMain(command: string, rest: string[]): Promise<number> {
       }
       case "audit": {
         process.stdout.write(toolAudit({ format: flags.json ? "json" : "pretty" }) + "\n");
+        return 0;
+      }
+      case "export-pubkey": {
+        // CRP 1.1 · print the Ed25519 public key (PEM) so other MCP servers
+        // can verify receipts issued by this server without sharing the
+        // signing secret. Lazily initializes the keypair if missing.
+        const { publicKeyPem } = loadOrCreateEd25519Keys();
+        process.stdout.write(publicKeyPem);
         return 0;
       }
       case "ui": {
