@@ -219,4 +219,4 @@ MIT. Use it for whatever.
 
 ## Author
 
-[Wesley New](https://github.com/xultrax-web) · built for the cross-client memory problem I kept running into. Inspired by the file-based memory system in Anthropic's Claude Code.
+[@xultrax-web](https://github.com/xultrax-web) · built for the cross-client memory problem I kept running into. Inspired by the file-based memory system in Anthropic's Claude Code.
