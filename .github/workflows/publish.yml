@@ -1,0 +1,95 @@
+name: Publish on tag
+
+# Fires on git tags matching v* (v0.8.1, v0.9.0, v1.0.0-rc1, etc).
+# Publishes to BOTH npm and the MCP Registry using OIDC trusted
+# publishing — no long-lived tokens stored anywhere.
+#
+# Pre-requisite (one-time setup):
+#   - npm: configure Trusted Publisher at
+#     https://www.npmjs.com/package/@xultrax-web/agent-memory-mcp/access
+#     → Trusted Publishers → GitHub Actions
+#     → org: xultrax-web · repo: agent-memory-mcp · workflow: publish.yml
+#   - MCP Registry: nothing to configure; github-oidc login uses the
+#     same workflow OIDC token automatically.
+#
+# To release: `git tag v0.9.0 && git push origin v0.9.0`
+# The workflow handles version sync, build, tests, and both publishes.
+
+on:
+  push:
+    tags: ["v*"]
+
+  # Manual trigger for testing the workflow without pushing a tag
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (must match package.json + server.json)"
+        required: true
+        type: string
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # required for OIDC — both npm AND mcp-publisher
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Verify tag matches package.json version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            PKG_VERSION=$(jq -r .version package.json)
+            if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION"
+              exit 1
+            fi
+            echo "Tag $GITHUB_REF_NAME matches package.json version $PKG_VERSION ✓"
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Format check
+        run: npm run format:check
+
+      - name: Run tests
+        run: npm test
+
+      # ----------------------------------------------------------------
+      # npm publish via OIDC Trusted Publishing
+      # ----------------------------------------------------------------
+      - name: Publish to npm
+        run: npm publish --access public
+
+      # ----------------------------------------------------------------
+      # MCP Registry publish via GitHub Actions OIDC
+      # ----------------------------------------------------------------
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz \
+            | tar xz mcp-publisher
+          chmod +x ./mcp-publisher
+
+      - name: Sync server.json version from package.json
+        run: |
+          PKG_VERSION=$(jq -r .version package.json)
+          jq --arg v "$PKG_VERSION" '.version = $v | .packages[0].version = $v' server.json > server.tmp
+          mv server.tmp server.json
+          echo "server.json now declares version $PKG_VERSION"
+
+      - name: Authenticate to MCP Registry (OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish to MCP Registry
+        run: ./mcp-publisher publish
