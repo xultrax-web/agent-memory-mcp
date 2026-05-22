@@ -4,15 +4,16 @@
 
 ## Verification status
 
-| Client                    | Status      | Notes                                                                              |
-| ------------------------- | ----------- | ---------------------------------------------------------------------------------- |
-| Claude Code (Anthropic)   | Verified    | Native MCP support. Server's own tools register cleanly.                           |
-| Claude Desktop            | Config docs | Configured via `claude_desktop_config.json`. On Windows, wrap `npx` with `cmd /c`. |
-| Cursor                    | Config docs | Configured via `~/.cursor/mcp.json` (or `.cursor/mcp.json` in project).            |
-| Cline (VS Code extension) | Config docs | Add via Cline's MCP Servers UI.                                                    |
-| Continue.dev              | Config docs | Configured under `experimental.modelContextProtocolServers`.                       |
-| Windsurf                  | Untested    | Should work — uses standard MCP. Report at GitHub Issues if it doesn't.            |
-| Zed                       | Untested    | Should work — uses standard MCP. Report at GitHub Issues if it doesn't.            |
+| Client                    | Status      | Notes                                                                                              |
+| ------------------------- | ----------- | -------------------------------------------------------------------------------------------------- |
+| Claude Code (Anthropic)   | Verified    | Native MCP support. Server's own tools register cleanly.                                           |
+| Claude Desktop            | Config docs | Configured via `claude_desktop_config.json`. On Windows, wrap `npx` with `cmd /c`.                 |
+| Cursor                    | Config docs | Configured via `~/.cursor/mcp.json` (or `.cursor/mcp.json` in project).                            |
+| Cline (VS Code extension) | Config docs | Add via Cline's MCP Servers UI.                                                                    |
+| VS Code (Copilot Chat)    | Config docs | Native MCP. `.vscode/mcp.json` (workspace) or `mcp.json` in User Settings. Uses `"type": "stdio"`. |
+| Continue.dev              | Config docs | Configured under `experimental.modelContextProtocolServers`.                                       |
+| Windsurf                  | Untested    | Should work — uses standard MCP. Report at GitHub Issues if it doesn't.                            |
+| Zed                       | Untested    | Should work — uses standard MCP. Report at GitHub Issues if it doesn't.                            |
 
 **"Verified"** means the server has been launched by that client and exercised through real tool calls and resource fetches.
 

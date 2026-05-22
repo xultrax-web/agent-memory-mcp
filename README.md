@@ -227,6 +227,24 @@ Cline → MCP Servers → Add:
 }
 ```
 
+### VS Code (Copilot Chat)
+
+> **Two VS Code paths.** The Cline section above is for the Cline extension specifically (its own MCP server UI). This section is for VS Code's native MCP support — GitHub Copilot Chat reads it directly. Pick whichever matches your assistant; both coexist fine.
+
+`.vscode/mcp.json` (workspace) or via User Settings → Edit `mcp.json`:
+
+```json
+{
+  "servers": {
+    "agent-memory": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@xultrax-web/agent-memory-mcp"]
+    }
+  }
+}
+```
+
 ### Claude Desktop
 
 `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
