@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/xultrax-web/agent-memory-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/xultrax-web/agent-memory-mcp/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg)](https://nodejs.org)
+[![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](https://nodejs.org)
 [![MCP](https://img.shields.io/badge/MCP-server-blueviolet)](https://modelcontextprotocol.io)
 
 **The only MCP memory server that isn't a database.** Every other option asks you to trust a knowledge graph, a vector DB, Postgres + pgvector, DuckDB, or Neo4j. This one writes plain markdown files to a directory.
