@@ -43,11 +43,35 @@ Companion file targets (v0.11.1):
 
 Set `AGENT_MEMORY_AUTO_EMIT_DIR=/path/to/project` to auto-regenerate all companions on every rule save.
 
-Roadmap for the v0.11.x series:
+### Compliance Receipts (v0.11.2 · primitive · tool wiring in v0.11.3)
 
-- Compliance Receipts (Macaroon-style HMAC tokens · protocol-level enforcement of our own destructive tools)
-- `check_action` tool (deterministic rule matching · optional Sampling enrichment where clients support it)
-- `audit` command (rule conflicts · staleness · receipt-denial log)
+Receipts are short-lived, HMAC-signed bearer tokens with caveats (Macaroon pattern · [Birgisson et al., NDSS 2014](https://research.google/pubs/pub41892/)). The novel protocol primitive in agent-memory-mcp: server-issued tokens that bind to action + session + rules-version-hash + expiry. Tampering breaks the HMAC. Rule changes invalidate stale receipts (because `rules_version` is part of the signed payload).
+
+```typescript
+import { issueReceipt, validateReceipt } from "@xultrax-web/agent-memory-mcp";
+
+// Server-internal: issue a receipt for a destructive action
+const r = issueReceipt({
+  caveats: [
+    { type: "action", value: "delete_memory" },
+    { type: "session", value: "sess_abc123" },
+  ],
+  ttl_seconds: 60,
+});
+
+// Later: validate before executing the destructive op
+const v = validateReceipt(r, {
+  required_caveats: [{ type: "action", value: "delete_memory" }],
+});
+if (!v.valid) throw new Error(v.reason);
+```
+
+HMAC key lives at `<MEMORY_DIR>/.keyring/hmac-key` · 32 random bytes · mode `0600`. v0.11.3 wires receipts into `delete_memory` + other destructive tools and adds the `check_action` MCP tool.
+
+### Roadmap for the v0.11.x series:
+
+- `check_action` tool · deterministic rule matching · optional Sampling enrichment where clients support it · issues Compliance Receipts when proposed action passes
+- `audit` command · rule conflicts · staleness · receipt-denial log
 
 ---
 

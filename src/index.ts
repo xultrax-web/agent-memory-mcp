@@ -35,6 +35,7 @@ import {
 import Fuse from "fuse.js";
 import matter from "gray-matter";
 import { spawnSync } from "node:child_process";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -1510,6 +1511,214 @@ function toolSaveRule(args: Record<string, unknown>): string {
 }
 
 // -------------------------------------------------------------
+// Compliance Receipts · v0.11.2 · the novel protocol primitive
+// -------------------------------------------------------------
+//
+// Receipts are short-lived, HMAC-signed bearer tokens with caveats
+// (attenuations). Macaroon-style. Issued by `check_action` (v0.11.3),
+// validated before our own destructive tools execute. Prior art:
+//
+//   Birgisson et al · "Macaroons: Cookies with Contextual Caveats for
+//   Decentralized Authorization in the Cloud" · Google Research,
+//   NDSS 2014 · https://research.google/pubs/pub41892/
+//
+// Why receipts work where MCP Sampling doesn't:
+//   - MCP Sampling is unsupported on Claude Code / Cursor / Cline /
+//     Codex CLI (the primary coding clients) per the MCP client matrix.
+//   - Receipts are server-issued protocol artifacts — they work on every
+//     client because the server controls both ends (issue + validate).
+//   - Receipts bind to: action + session + rules-version-hash + expiry.
+//     Tampering breaks the HMAC. Rule changes invalidate stale receipts.
+//
+// Storage:
+//   HMAC key lives at <MEMORY_DIR>/.keyring/hmac-key · 32 random bytes
+//   created on first use with mode 0o600 (owner read/write only).
+//   Caller-rotatable via `agent-memory rotate-key` (a v0.11.x follow-up).
+//
+// v0.11.2 ships the PRIMITIVE only — issuance + validation +
+// canonicalization. Tool wiring (delete_memory + check_action) lands
+// in v0.11.3.
+
+const KEYRING_DIR = join(MEMORY_DIR, ".keyring");
+const HMAC_KEY_FILE = join(KEYRING_DIR, "hmac-key");
+const RECEIPT_DEFAULT_TTL_SECONDS = 60;
+
+export interface Caveat {
+  /** Caveat kind. Reserved: "action", "session", "scope", "expires_before". Custom kinds are allowed. */
+  type: string;
+  /** Type-specific value. Compared with exact-string equality. */
+  value: string;
+}
+
+export interface ComplianceReceipt {
+  /** Unique receipt id · "rcpt_" + 16 hex chars. Logged for audit. */
+  id: string;
+  /** Unix epoch seconds when the receipt was issued. */
+  issued_at: number;
+  /** Unix epoch seconds after which the receipt is no longer valid. */
+  expires_at: number;
+  /** sha256 (first 16 hex chars) of the rule-store contents at issue time. */
+  rules_version: string;
+  /** Constraints attached to this receipt. Validation requires all required caveats to be present. */
+  caveats: Caveat[];
+  /** Hex-encoded HMAC-SHA256 of the canonical form (excluding this field). */
+  signature: string;
+}
+
+function loadOrCreateHmacKey(): Buffer {
+  if (existsSync(HMAC_KEY_FILE)) {
+    return readFileSync(HMAC_KEY_FILE);
+  }
+  if (!existsSync(KEYRING_DIR)) {
+    mkdirSync(KEYRING_DIR, { recursive: true });
+  }
+  const key = randomBytes(32); // 256 bits · plenty for HMAC-SHA256
+  // mode 0o600 is owner-only on POSIX; Windows ignores mode but ACLs
+  // default to the user, so practically equivalent for our threat model.
+  writeFileSync(HMAC_KEY_FILE, key, { mode: 0o600 });
+  return key;
+}
+
+/**
+ * Compute the rules-version hash · first 16 hex chars of SHA-256 over
+ * the concatenated bytes of every type=rule memory file, in sorted
+ * filename order. Any rule add / edit / remove changes this hash,
+ * which invalidates outstanding receipts (they were issued against a
+ * different rule set).
+ */
+function computeRulesVersion(): string {
+  const rules = loadAllRules();
+  const sortedPaths = rules.map((r) => r.filePath).sort();
+  const hash = createHash("sha256");
+  for (const fp of sortedPaths) {
+    try {
+      hash.update(readFileSync(fp));
+    } catch {
+      // File disappeared between listMemoryFiles + read; skip it.
+      // Next computation will reflect the change.
+    }
+  }
+  return hash.digest("hex").slice(0, 16);
+}
+
+/**
+ * Deterministic canonical form for HMAC input · caveats sorted by
+ * (type, value) so the order in which the caller listed them doesn't
+ * change the signature. JSON with no whitespace (single line) so the
+ * exact byte sequence is reproducible across platforms.
+ */
+function canonicalizeReceipt(r: Omit<ComplianceReceipt, "signature">): string {
+  const sortedCaveats = [...r.caveats].sort((a, b) =>
+    a.type === b.type ? a.value.localeCompare(b.value) : a.type.localeCompare(b.type),
+  );
+  return JSON.stringify({
+    id: r.id,
+    issued_at: r.issued_at,
+    expires_at: r.expires_at,
+    rules_version: r.rules_version,
+    caveats: sortedCaveats,
+  });
+}
+
+function signReceipt(r: Omit<ComplianceReceipt, "signature">): string {
+  const key = loadOrCreateHmacKey();
+  return createHmac("sha256", key).update(canonicalizeReceipt(r)).digest("hex");
+}
+
+export interface IssueReceiptOptions {
+  /** Caveats attached to the receipt. Empty array allowed but rare. */
+  caveats: Caveat[];
+  /** Seconds until expiry · defaults to 60. Receipts SHOULD be short-lived. */
+  ttl_seconds?: number;
+}
+
+/**
+ * Issue a fresh Compliance Receipt with the given caveats. The receipt
+ * is bound to the current rule-store hash; any rule edit invalidates it.
+ */
+export function issueReceipt(opts: IssueReceiptOptions): ComplianceReceipt {
+  const now = Math.floor(Date.now() / 1000);
+  const ttl = Math.max(1, opts.ttl_seconds ?? RECEIPT_DEFAULT_TTL_SECONDS);
+  const base: Omit<ComplianceReceipt, "signature"> = {
+    id: "rcpt_" + randomBytes(8).toString("hex"),
+    issued_at: now,
+    expires_at: now + ttl,
+    rules_version: computeRulesVersion(),
+    caveats: opts.caveats,
+  };
+  return { ...base, signature: signReceipt(base) };
+}
+
+export interface ValidateReceiptOptions {
+  /** Caveats that MUST be present on the receipt. Each must exact-match by (type, value). */
+  required_caveats?: Caveat[];
+  /** Override the current rules version (for tests). Default: recompute live. */
+  current_rules_version?: string;
+}
+
+export interface ValidateReceiptResult {
+  valid: boolean;
+  /** Reason for rejection · only present when valid=false. */
+  reason?: string;
+}
+
+/**
+ * Validate a Compliance Receipt against the current rule store + caller's
+ * required caveats. Returns {valid: true} on success, otherwise
+ * {valid: false, reason: <human-readable>}.
+ */
+export function validateReceipt(
+  receipt: ComplianceReceipt,
+  opts: ValidateReceiptOptions = {},
+): ValidateReceiptResult {
+  // 1. HMAC verification · constant-time compare to avoid timing leaks.
+  const expected = signReceipt({
+    id: receipt.id,
+    issued_at: receipt.issued_at,
+    expires_at: receipt.expires_at,
+    rules_version: receipt.rules_version,
+    caveats: receipt.caveats,
+  });
+  const expectedBuf = Buffer.from(expected, "hex");
+  const actualBuf = Buffer.from(receipt.signature, "hex");
+  if (expectedBuf.length !== actualBuf.length || !timingSafeEqual(expectedBuf, actualBuf)) {
+    return { valid: false, reason: "invalid signature" };
+  }
+
+  // 2. Expiry · receipts past their expires_at are dead.
+  const now = Math.floor(Date.now() / 1000);
+  if (now > receipt.expires_at) {
+    return { valid: false, reason: "receipt expired" };
+  }
+
+  // 3. Rules-version binding · any rule edit since issuance invalidates.
+  const currentRulesVersion = opts.current_rules_version ?? computeRulesVersion();
+  if (receipt.rules_version !== currentRulesVersion) {
+    return {
+      valid: false,
+      reason: `rules changed since receipt issued (was ${receipt.rules_version}, now ${currentRulesVersion})`,
+    };
+  }
+
+  // 4. Required-caveat check · each required pair must appear on the receipt.
+  if (opts.required_caveats) {
+    for (const required of opts.required_caveats) {
+      const found = receipt.caveats.find(
+        (c) => c.type === required.type && c.value === required.value,
+      );
+      if (!found) {
+        return {
+          valid: false,
+          reason: `missing required caveat: ${required.type}=${required.value}`,
+        };
+      }
+    }
+  }
+
+  return { valid: true };
+}
+
+// -------------------------------------------------------------
 // Git sync · multi-machine memory via git remote
 // -------------------------------------------------------------
 //
@@ -1884,7 +2093,7 @@ function actionColor(action: string): string {
 // -------------------------------------------------------------
 
 const server = new Server(
-  { name: "agent-memory", version: "0.11.1" },
+  { name: "agent-memory", version: "0.11.2" },
   { capabilities: { tools: {}, resources: {}, prompts: {} } },
 );
 
