@@ -64,17 +64,15 @@ If you want vector similarity search, semantic recall, or auto-relation extracti
 
 ## Install
 
-### Quick start (works today, no npm needed)
-
-```bash
-npx -y github:xultrax-web/agent-memory-mcp
-```
-
-### From npm (once published — landing v0.4.0)
+### From npm (recommended)
 
 ```bash
 npx -y @xultrax-web/agent-memory-mcp
 ```
+
+### Listed in the MCP Registry
+
+`io.github.xultrax-web/agent-memory-mcp` · browse at https://registry.modelcontextprotocol.io
 
 ### Build locally
 
@@ -103,7 +101,7 @@ Same JSON, slightly different paths per client.
   "mcpServers": {
     "agent-memory": {
       "command": "npx",
-      "args": ["-y", "github:xultrax-web/agent-memory-mcp"]
+      "args": ["-y", "@xultrax-web/agent-memory-mcp"]
     }
   }
 }
@@ -117,7 +115,7 @@ Cline → MCP Servers → Add:
 {
   "agent-memory": {
     "command": "npx",
-    "args": ["-y", "github:xultrax-web/agent-memory-mcp"]
+    "args": ["-y", "@xultrax-web/agent-memory-mcp"]
   }
 }
 ```
@@ -131,7 +129,7 @@ Cline → MCP Servers → Add:
   "mcpServers": {
     "agent-memory": {
       "command": "npx",
-      "args": ["-y", "github:xultrax-web/agent-memory-mcp"]
+      "args": ["-y", "@xultrax-web/agent-memory-mcp"]
     }
   }
 }
@@ -140,7 +138,7 @@ Cline → MCP Servers → Add:
 > **Windows note:** if `npx` doesn't resolve cleanly, wrap with `cmd /c`:
 >
 > ```json
-> { "command": "cmd", "args": ["/c", "npx", "-y", "github:xultrax-web/agent-memory-mcp"] }
+> { "command": "cmd", "args": ["/c", "npx", "-y", "@xultrax-web/agent-memory-mcp"] }
 > ```
 
 ### Continue.dev
@@ -155,7 +153,7 @@ Cline → MCP Servers → Add:
         "transport": {
           "type": "stdio",
           "command": "npx",
-          "args": ["-y", "github:xultrax-web/agent-memory-mcp"]
+          "args": ["-y", "@xultrax-web/agent-memory-mcp"]
         }
       }
     ]
