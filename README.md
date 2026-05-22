@@ -7,9 +7,9 @@
 [![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](https://nodejs.org)
 [![MCP](https://img.shields.io/badge/MCP-server-blueviolet)](https://modelcontextprotocol.io)
 
-**The only MCP memory server that isn't a database.** Every other option asks you to trust a knowledge graph, a vector DB, Postgres + pgvector, DuckDB, or Neo4j. This one writes plain markdown files to a directory.
+**Markdown memory for AI agents.** Plain files in a directory you control — read them, edit them, grep them, commit them. Operator-grade storage primitives (atomic writes, file locking, soft-delete to `.trash/`, schema versioning, doctor command) wrap the files so nothing rots in the long tail.
 
-You can `cat` your memory. You can `grep` it. You can edit it in vim. You can commit it to git. You can move it between machines with `scp`. If the AI gets it wrong, you fix it in a text editor and save. No migration scripts. No vendor lock-in. No "just trust the embedding."
+You can `cat` your memory. You can `grep` it. You can edit it in vim. You can commit it to git. You can move it between machines with `scp` or with the built-in `agent-memory sync` (git-backed). If the AI gets a memory wrong, you fix it in a text editor and save. No migration scripts. No vendor lock-in.
 
 ---
 
@@ -350,22 +350,11 @@ The importer walks `~/.claude/projects/*/memory/`, parses each memory's YAML fro
 
 ---
 
-## How it compares
+## Why files, not a database
 
-The memory MCP landscape, as of May 2026:
+You give up native semantic similarity search and structured entity-relation queries. You get a memory store that survives every tool change, every machine swap, every "wait, what was that AI telling me about this codebase six months ago?" — and that you can still read after a power outage.
 
-| Server                                           | Backend                | Hand-editable? | Greppable? | Git-friendly?  |
-| ------------------------------------------------ | ---------------------- | -------------- | ---------- | -------------- |
-| **agent-memory-mcp (this)**                      | **Markdown files**     | **Yes**        | **Yes**    | **Yes**        |
-| `@modelcontextprotocol/server-memory` (official) | Knowledge graph (JSON) | No (raw JSON)  | Limited    | Painful merges |
-| memory-graph/memory-graph                        | Graph DB               | No             | No         | No             |
-| IzumiSy/mcp-duckdb-memory-server                 | DuckDB                 | No             | No         | No             |
-| sdimitrov/mcp-memory                             | Postgres + pgvector    | No             | No         | No             |
-| JovanHsu/mcp-neo4j-memory-server                 | Neo4j                  | No             | No         | No             |
-
-**The trade you're making:** you give up native semantic similarity search and structured entity-relation queries. You get a memory store that survives every tool change, every machine swap, every "wait, what was that AI telling me about this codebase six months ago?"
-
-For most workflows that's a good trade. For some it isn't. Pick the right tool.
+The trade is real. For workflows that need vector recall or graph queries, a database-backed memory is the right tool. For workflows where memory is something you want to grep, edit, version-control, and audit by hand, this is.
 
 ---
 
