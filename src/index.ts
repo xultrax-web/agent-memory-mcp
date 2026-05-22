@@ -26,6 +26,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
+  CreateMessageResultSchema,
   GetPromptRequestSchema,
   ListPromptsRequestSchema,
   ListResourcesRequestSchema,
@@ -1855,10 +1856,99 @@ export function checkActionAgainstRules(
   return { hard, soft, rules_evaluated: rules.length };
 }
 
-function toolCheckAction(args: Record<string, unknown>): string {
+/**
+ * Tier-2 Sampling enrichment · runs ONE rule's natural-language
+ * applies_when conditions past an LLM via MCP sampling/createMessage.
+ * The server makes the request; the client decides (per MCP spec)
+ * whether to forward to its LLM, prompt the user, or refuse.
+ *
+ * On any error (client lacks sampling, user refused, unparseable
+ * response), returns null — Tier-2 silently degrades to "no extra
+ * violations found" and we ship the Tier-1 result.
+ */
+function clientSupportsSampling(): boolean {
+  // server.getClientCapabilities() is undefined before the MCP initialize
+  // handshake; once initialized, returns the capabilities the client
+  // declared. We only call Sampling if `sampling` is in there — saves a
+  // round-trip and prevents test harnesses (which don't respond to
+  // sampling/createMessage) from hanging.
+  try {
+    const caps = server.getClientCapabilities();
+    return !!caps?.sampling;
+  } catch {
+    return false;
+  }
+}
+
+async function runTier2Sampling(
+  rule: Memory,
+  action: string,
+  actionType: string,
+): Promise<RuleViolation | null> {
+  if (!rule.applies_when || rule.applies_when.length === 0) return null;
+  if (!clientSupportsSampling()) return null;
+
+  const prompt =
+    `You are evaluating whether a proposed action violates an operator rule.\n\n` +
+    `RULE:\n` +
+    `  name: ${rule.name}\n` +
+    `  description: ${rule.description}\n` +
+    `  severity: ${rule.severity ?? "soft"}\n` +
+    `  applies_when:\n` +
+    rule.applies_when.map((s) => `    - ${s}`).join("\n") +
+    `\n\nPROPOSED ACTION:\n` +
+    `  ${action}\n` +
+    `  (category: ${actionType})\n\n` +
+    `Does the proposed action match any of the "applies_when" conditions?\n` +
+    `Respond with strict JSON only, no commentary: {"violates": true|false, "reason": "..."}.\n` +
+    `If the action is ambiguous, answer false.`;
+
+  try {
+    const result = await server.request(
+      {
+        method: "sampling/createMessage",
+        params: {
+          messages: [{ role: "user", content: { type: "text", text: prompt } }],
+          systemPrompt: "You are a strict policy evaluator. Reply with JSON only.",
+          maxTokens: 200,
+          modelPreferences: { intelligencePriority: 0.8, speedPriority: 0.4 },
+        },
+      },
+      CreateMessageResultSchema,
+    );
+    const text = result.content.type === "text" ? result.content.text : "";
+    // Tolerate a stray code-fence around the JSON.
+    const cleaned = text.trim().replace(/^```(?:json)?\s*|\s*```$/g, "");
+    const parsed = JSON.parse(cleaned) as { violates?: boolean; reason?: string };
+    if (parsed.violates === true) {
+      return {
+        rule: rule.name,
+        severity: rule.severity ?? "soft",
+        reason: `Sampling judgment: ${parsed.reason ?? "applies_when matched"}`,
+      };
+    }
+    return null;
+  } catch (err) {
+    // Sampling unsupported on this client, user refused, response
+    // unparseable, or any other transport-level failure. Degrade
+    // silently to Tier-1 only · we never block a check_action call
+    // because Tier-2 couldn't run.
+    log("debug", "tier2_sampling_skipped", {
+      rule: rule.name,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
+async function toolCheckAction(args: Record<string, unknown>): Promise<string> {
   const action = String(args.action ?? "").trim();
   const actionType = String(args.action_type ?? "").trim();
   const sessionId = typeof args.session_id === "string" ? args.session_id.trim() : "";
+  // Tier-2 Sampling is opt-out: defaults to true on clients that support
+  // it; gracefully degrades on clients that don't. Set to false to skip
+  // the LLM round-trip entirely (e.g. for batched/script use).
+  const tier2Enabled = args.use_sampling !== false;
 
   if (!action) throw new Error("action is required (the proposed action description)");
   if (!actionType)
@@ -1867,6 +1957,28 @@ function toolCheckAction(args: Record<string, unknown>): string {
     );
 
   const { hard, soft, rules_evaluated } = checkActionAgainstRules(action, actionType);
+
+  // Tier-2: run Sampling for any rule with applies_when that DIDN'T
+  // already match deterministically. Rules already flagged in Tier-1
+  // don't need a Sampling round-trip (we know they violate).
+  if (tier2Enabled) {
+    const tier1HitRules = new Set([...hard.map((v) => v.rule), ...soft.map((v) => v.rule)]);
+    const rules = loadAllRules();
+    const tier2Candidates = rules.filter(
+      (r) =>
+        r.applies_when &&
+        r.applies_when.length > 0 &&
+        !tier1HitRules.has(r.name) &&
+        (!r.enforce_on || r.enforce_on.length === 0 || r.enforce_on.includes(actionType)),
+    );
+    for (const rule of tier2Candidates) {
+      const violation = await runTier2Sampling(rule, action, actionType);
+      if (violation) {
+        if (violation.severity === "hard") hard.push(violation);
+        else soft.push(violation);
+      }
+    }
+  }
 
   if (hard.length > 0) {
     const result: CheckActionResult = {
@@ -2558,7 +2670,7 @@ function actionColor(action: string): string {
 // -------------------------------------------------------------
 
 const server = new Server(
-  { name: "agent-memory", version: "0.11.6" },
+  { name: "agent-memory", version: "0.11.7" },
   { capabilities: { tools: {}, resources: {}, prompts: {} } },
 );
 
@@ -3154,7 +3266,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         "  - APPROVES: returns a short-lived Compliance Receipt (HMAC-signed, 60s default) the agent can pass to destructive tools (e.g. delete_memory) as proof of compliance.\n" +
         "  - DENIES: returns structured hard_violations (severity:hard rules that block) and/or soft_warnings (severity:soft rules that warn but allow).\n\n" +
         "Tier 1 (deterministic) matches the action against rule.matches regexes + rule.enforce_on category filter. Works on every MCP client.\n" +
-        "Tier 2 (Sampling-enriched LLM judgment on rule.applies_when) ships in v0.11.3.x for clients that support Sampling (Claude Desktop, VS Code Copilot).",
+        "Tier 2 (v0.11.7+) calls back to the client via MCP sampling/createMessage to judge rule.applies_when natural-language conditions. Auto-enabled on clients that declared the sampling capability; silently skipped on clients that didn't.",
       inputSchema: {
         type: "object",
         properties: {
@@ -3172,6 +3284,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             description:
               "Optional session identifier · binds the issued receipt to this session via a caveat.",
+          },
+          use_sampling: {
+            type: "boolean",
+            description:
+              "Opt out of Tier-2 Sampling enrichment (default true). Set false for batched/scripted use where the Sampling round-trip would add latency. CLI invocations default this to false automatically.",
           },
         },
         required: ["action", "action_type"],
@@ -3271,7 +3388,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         result = toolEmitCompanions(args);
         break;
       case "check_action":
-        result = toolCheckAction(args);
+        result = await toolCheckAction(args);
         break;
       case "audit":
         result = toolAudit(args);
@@ -3586,11 +3703,14 @@ async function cliMain(command: string, rest: string[]): Promise<number> {
           );
         }
         process.stdout.write(
-          toolCheckAction({
+          (await toolCheckAction({
             action,
             action_type: actionType,
             session_id: flags.session ? String(flags.session) : undefined,
-          }) + "\n",
+            // CLI invocations don't have a Sampling-capable client attached,
+            // so skip Tier 2 to avoid a timeout · keeps the CLI fast.
+            use_sampling: false,
+          })) + "\n",
         );
         return 0;
       }

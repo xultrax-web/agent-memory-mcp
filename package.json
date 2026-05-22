@@ -1,6 +1,6 @@
 {
   "name": "@xultrax-web/agent-memory-mcp",
-  "version": "0.11.6",
+  "version": "0.11.7",
   "mcpName": "io.github.xultrax-web/agent-memory-mcp",
   "description": "Codify how you work. Every AI tool obeys. Markdown rules + cross-tool companion files (AGENTS.md/CLAUDE.md/.cursor/rules/.gemini) + Compliance Receipts for protocol-level enforcement of destructive ops. Reference implementation of CRP 1.0. Works on every MCP client (no Sampling required).",
   "type": "module",
