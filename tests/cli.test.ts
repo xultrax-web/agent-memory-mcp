@@ -422,6 +422,31 @@ describe("CLI · tags + backlinks + related", () => {
   });
 });
 
+describe("CLI · sync (without repo)", () => {
+  test("sync status reports 'not a git repo' cleanly", () => {
+    runCli(dir, ["save", "x", "--type", "user", "--description", "x", "--content", "x"]);
+    const r = runCli(dir, ["sync", "status"]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("not a git repo");
+    expect(r.stdout).toContain("sync init");
+  });
+
+  test("sync push requires init first", () => {
+    runCli(dir, ["save", "x", "--type", "user", "--description", "x", "--content", "x"]);
+    const r = runCli(dir, ["sync", "push"]);
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("not a git repo");
+  });
+
+  test("sync (no subcommand) prints usage", () => {
+    const r = runCli(dir, ["sync"]);
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("init");
+    expect(r.stderr).toContain("push");
+    expect(r.stderr).toContain("pull");
+  });
+});
+
 describe("CLI · meta", () => {
   test("help prints usage", () => {
     const r = runCli(dir, ["help"]);

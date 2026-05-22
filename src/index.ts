@@ -34,6 +34,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import Fuse from "fuse.js";
 import matter from "gray-matter";
+import { spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -1093,6 +1094,255 @@ function toolFindRelated(args: Record<string, unknown>): string {
 }
 
 // -------------------------------------------------------------
+// Git sync · multi-machine memory via git remote
+// -------------------------------------------------------------
+//
+// The killer feature for file-based memory: every dev machine has git,
+// and markdown files merge cleanly. Convert .agent-memory/ into a git
+// repo, point it at a (private) GitHub repo, and `sync push` / `sync
+// pull` becomes the multi-machine story.
+//
+// Usage flow:
+//   agent-memory sync init git@github.com:you/agent-memory.git
+//   ... save some memories ...
+//   agent-memory sync push                # commit + push
+//   # later, on another machine:
+//   agent-memory sync pull                # pull updates
+//   agent-memory sync status              # ahead/behind/clean
+//
+// Files we EXCLUDE from sync (per-machine state):
+//   .lock          · proper-lockfile per-process lock
+//   .events.jsonl  · per-machine audit log
+//   .trash/        · per-machine soft-delete staging
+
+const SYNC_GITIGNORE =
+  "# Per-machine state · do not sync across devices\n" +
+  ".lock\n" +
+  ".events.jsonl\n" +
+  ".trash/\n";
+
+interface GitResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+}
+
+function git(args: string[]): GitResult {
+  // Inject a default commit identity so machines without `git config
+  // --global user.email` can still sync. Env vars are git's highest-
+  // precedence identity source, so they override any later config —
+  // fine for automated memory-sync where per-commit attribution
+  // doesn't matter. Honors operator overrides if set in the environment.
+  const result = spawnSync("git", args, {
+    cwd: MEMORY_DIR,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME ?? "agent-memory",
+      GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL ?? "agent-memory@local",
+      GIT_COMMITTER_NAME: process.env.GIT_COMMITTER_NAME ?? "agent-memory",
+      GIT_COMMITTER_EMAIL: process.env.GIT_COMMITTER_EMAIL ?? "agent-memory@local",
+    },
+  });
+  return {
+    stdout: (result.stdout ?? "").trim(),
+    stderr: (result.stderr ?? "").trim(),
+    exitCode: result.status ?? -1,
+  };
+}
+
+function isGitRepo(): boolean {
+  return existsSync(join(MEMORY_DIR, ".git"));
+}
+
+function requireRepo(): void {
+  if (!isGitRepo()) {
+    throw new Error(
+      `${MEMORY_DIR} is not a git repo. Run 'agent-memory sync init <remote-url>' first.`,
+    );
+  }
+}
+
+function toolSyncInit(args: Record<string, unknown>): string {
+  const remoteUrl = String(args.remote ?? args.url ?? "").trim();
+  if (!remoteUrl) {
+    throw new Error(
+      "Usage: agent-memory sync init <remote-url>\nExample: agent-memory sync init git@github.com:you/agent-memory.git",
+    );
+  }
+  ensureStorage();
+  if (isGitRepo()) {
+    return `${MEMORY_DIR} is already a git repo. Use 'sync push' or 'sync pull'.`;
+  }
+
+  const init = git(["init", "-b", "main"]);
+  if (init.exitCode !== 0) throw new Error(`git init failed: ${init.stderr}`);
+
+  writeFileSync(join(MEMORY_DIR, ".gitignore"), SYNC_GITIGNORE, "utf8");
+
+  const addRemote = git(["remote", "add", "origin", remoteUrl]);
+  if (addRemote.exitCode !== 0) throw new Error(`git remote add failed: ${addRemote.stderr}`);
+
+  const add = git(["add", "-A"]);
+  if (add.exitCode !== 0) throw new Error(`git add failed: ${add.stderr}`);
+
+  const commit = git(["commit", "-m", "agent-memory · initial sync"]);
+  // commit can fail if there's nothing to commit (empty store) — that's OK
+  if (commit.exitCode !== 0 && !commit.stderr.includes("nothing to commit")) {
+    log("warn", "initial commit had no changes", { stderr: commit.stderr });
+  }
+
+  const push = git(["push", "-u", "origin", "main"]);
+  logEvent("sync_init", { remote: remoteUrl, pushed: push.exitCode === 0 });
+
+  const lines = [
+    c(ANSI.green, "✓ initialized memory sync"),
+    `  storage : ${MEMORY_DIR}`,
+    `  remote  : ${remoteUrl}`,
+    `  branch  : main`,
+  ];
+  if (push.exitCode !== 0) {
+    lines.push("");
+    lines.push(c(ANSI.yellow, "Initial push failed (remote may not exist yet):"));
+    lines.push(`  ${push.stderr.split("\n")[0]}`);
+    lines.push("");
+    lines.push("Create the empty remote on GitHub (or your git host), then run:");
+    lines.push("  agent-memory sync push");
+  } else {
+    lines.push("");
+    lines.push("Future commands: 'sync push' / 'sync pull' / 'sync status' / 'sync log'");
+  }
+  return lines.join("\n");
+}
+
+function toolSyncStatus(_args: Record<string, unknown>): string {
+  if (!isGitRepo()) {
+    return `${MEMORY_DIR} is not a git repo. Use 'sync init <remote-url>' to set it up.`;
+  }
+
+  const remote = git(["remote", "get-url", "origin"]);
+  const branch = git(["branch", "--show-current"]);
+  const fetch = git(["fetch", "origin", "--quiet"]);
+  const offline = fetch.exitCode !== 0;
+
+  const status = git(["status", "--porcelain"]);
+  const localChanges = status.stdout.split("\n").filter(Boolean).length;
+
+  const lines: string[] = [];
+  lines.push(c(ANSI.bold, "agent-memory sync · status"));
+  lines.push(`  storage : ${MEMORY_DIR}`);
+  lines.push(`  remote  : ${remote.stdout || c(ANSI.yellow, "(none configured)")}`);
+  lines.push(`  branch  : ${branch.stdout || "(unknown)"}`);
+  if (offline) {
+    lines.push(`  fetch   : ${c(ANSI.yellow, "offline — couldn't reach remote")}`);
+  }
+  lines.push("");
+  lines.push(c(ANSI.bold, "local state:"));
+  if (localChanges === 0) {
+    lines.push(`  ${c(ANSI.green, "✓ clean")} — no uncommitted changes`);
+  } else {
+    lines.push(
+      `  ${c(ANSI.yellow, `${localChanges} file(s) uncommitted`)} — run 'sync push' to commit + send`,
+    );
+  }
+
+  if (!offline && branch.stdout) {
+    const ahead = git(["rev-list", "--count", `origin/${branch.stdout}..HEAD`]);
+    const behind = git(["rev-list", "--count", `HEAD..origin/${branch.stdout}`]);
+    const aheadN = Number(ahead.stdout || "0");
+    const behindN = Number(behind.stdout || "0");
+    lines.push("");
+    lines.push(c(ANSI.bold, "vs origin:"));
+    if (aheadN === 0 && behindN === 0) {
+      lines.push(`  ${c(ANSI.green, "✓ in sync")}`);
+    } else {
+      if (aheadN > 0)
+        lines.push(`  ${c(ANSI.cyan, `↑ ${aheadN} commit(s) ahead`)} — run 'sync push'`);
+      if (behindN > 0)
+        lines.push(`  ${c(ANSI.cyan, `↓ ${behindN} commit(s) behind`)} — run 'sync pull'`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function toolSyncPush(args: Record<string, unknown>): string {
+  requireRepo();
+
+  const message = args.message
+    ? String(args.message)
+    : `agent-memory · sync ${new Date().toISOString().slice(0, 19).replace("T", " ")}Z`;
+
+  const add = git(["add", "-A"]);
+  if (add.exitCode !== 0) throw new Error(`git add failed: ${add.stderr}`);
+
+  const status = git(["status", "--porcelain"]);
+  const hadChanges = status.stdout.length > 0;
+
+  if (hadChanges) {
+    const commit = git(["commit", "-m", message]);
+    if (commit.exitCode !== 0) throw new Error(`commit failed: ${commit.stderr}`);
+  }
+
+  const push = git(["push"]);
+  if (push.exitCode !== 0) throw new Error(`push failed: ${push.stderr}`);
+
+  logEvent("sync_push", { hadChanges, commitMessage: hadChanges ? message : null });
+
+  return hadChanges
+    ? c(ANSI.green, `✓ committed local changes + pushed to remote\n  message: ${message}`)
+    : c(ANSI.green, `✓ nothing new locally; pushed any unpushed commits`);
+}
+
+function toolSyncPull(_args: Record<string, unknown>): string {
+  requireRepo();
+
+  const status = git(["status", "--porcelain"]);
+  if (status.stdout) {
+    return (
+      c(ANSI.yellow, "Local changes uncommitted.") +
+      "\nRun 'agent-memory sync push' first to commit them, then pull."
+    );
+  }
+
+  const pull = git(["pull", "--ff-only"]);
+  if (pull.exitCode !== 0) {
+    return (
+      c(ANSI.red, "✗ pull failed:") +
+      `\n  ${pull.stderr.split("\n").slice(0, 3).join("\n  ")}\n\n` +
+      `Likely diverged history (commits on both sides). Resolve manually:\n` +
+      `  cd ${MEMORY_DIR}\n` +
+      `  git pull   # do the merge by hand`
+    );
+  }
+
+  logEvent("sync_pull", { output: pull.stdout.split("\n")[0] });
+
+  return c(ANSI.green, "✓ pulled from remote") + (pull.stdout ? `\n${pull.stdout}` : "");
+}
+
+function toolSyncLog(args: Record<string, unknown>): string {
+  if (!isGitRepo()) return `${MEMORY_DIR} is not a git repo.`;
+  const limit = args.limit ? Number(args.limit) : 20;
+  const log = git(["log", `--max-count=${limit}`, "--pretty=format:%h %ci %s", "--no-decorate"]);
+  if (log.exitCode !== 0) return `git log failed: ${log.stderr}`;
+  if (!log.stdout) return "No sync history yet.";
+
+  const lines: string[] = [];
+  lines.push(c(ANSI.bold, `Recent sync history (last ${limit}):`));
+  lines.push("");
+  for (const line of log.stdout.split("\n")) {
+    // Format: <short-sha> <iso-date> <subject>
+    const m = line.match(/^(\S+)\s+(\S+\s+\S+\s+\S+)\s+(.*)$/);
+    if (m) {
+      lines.push(`  ${c(ANSI.cyan, m[1])}  ${c(ANSI.dim, m[2])}  ${m[3]}`);
+    } else {
+      lines.push(`  ${line}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+// -------------------------------------------------------------
 // Stats · operator dashboard
 // -------------------------------------------------------------
 
@@ -1218,7 +1468,7 @@ function actionColor(action: string): string {
 // -------------------------------------------------------------
 
 const server = new Server(
-  { name: "agent-memory", version: "0.8.1" },
+  { name: "agent-memory", version: "0.9.0" },
   { capabilities: { tools: {}, resources: {}, prompts: {} } },
 );
 
@@ -1687,6 +1937,32 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["name"],
       },
     },
+    {
+      name: "sync_status",
+      description:
+        "Report the git-sync state of the memory store: remote URL, branch, local uncommitted files, commits ahead/behind origin. Use this before opening a new session to know if you have stale memories from another machine.",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "sync_push",
+      description:
+        "Commit any local memory changes and push to the configured git remote. Auto-generates a timestamped commit message if none provided. Use at the end of a session to make memories available on your other machines.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          message: {
+            type: "string",
+            description: "Optional commit message. Defaults to a timestamp.",
+          },
+        },
+      },
+    },
+    {
+      name: "sync_pull",
+      description:
+        "Pull memory updates from the configured git remote (fast-forward only). Run at the start of a session to get memories saved on other machines. Refuses to pull if there are uncommitted local changes.",
+      inputSchema: { type: "object", properties: {} },
+    },
   ],
 }));
 
@@ -1734,6 +2010,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "find_related":
         result = toolFindRelated(args);
         break;
+      case "sync_status":
+        result = toolSyncStatus(args);
+        break;
+      case "sync_push":
+        result = toolSyncPush(args);
+        break;
+      case "sync_pull":
+        result = toolSyncPull(args);
+        break;
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
@@ -1770,6 +2055,7 @@ const CLI_COMMANDS = new Set([
   "verify",
   "backlinks",
   "related",
+  "sync",
   "import-claude-code",
   "help",
   "--help",
@@ -1933,6 +2219,40 @@ async function cliMain(command: string, rest: string[]): Promise<number> {
         );
         return 0;
       }
+      case "sync": {
+        const sub = positional[0];
+        if (!sub) {
+          throw new Error(
+            "Usage: agent-memory sync <init|push|pull|status|log>\n" +
+              "  init <remote-url>       set up a new memory-sync repo\n" +
+              "  push [--message X]      commit + push local changes\n" +
+              "  pull                    fast-forward pull from remote\n" +
+              "  status                  show local + remote state\n" +
+              "  log [--limit N]         recent sync commit history",
+          );
+        }
+        switch (sub) {
+          case "init":
+            process.stdout.write(toolSyncInit({ remote: positional[1] }) + "\n");
+            return 0;
+          case "push":
+            process.stdout.write(toolSyncPush({ message: flags.message }) + "\n");
+            return 0;
+          case "pull":
+            process.stdout.write(toolSyncPull({}) + "\n");
+            return 0;
+          case "status":
+            process.stdout.write(toolSyncStatus({}) + "\n");
+            return 0;
+          case "log":
+            process.stdout.write(
+              toolSyncLog({ limit: flags.limit ? Number(flags.limit) : undefined }) + "\n",
+            );
+            return 0;
+          default:
+            throw new Error(`Unknown sync subcommand: ${sub}. Try 'sync' for help.`);
+        }
+      }
       case "log": {
         process.stdout.write(
           toolLogEvents({
@@ -1994,6 +2314,12 @@ COMMANDS
   backlinks <name>                         List memories that link to <name> via [[wiki-links]].
   related <name> [--max N]                 Surface related memories via outbound + inbound links,
                                            shared tags, type match, content similarity.
+  sync <init|push|pull|status|log>         Multi-machine memory via git remote.
+    sync init <remote-url>                   Initialize .agent-memory/ as a git repo + push.
+    sync push [--message X]                  Commit local changes + push to remote.
+    sync pull                                Fast-forward pull from remote.
+    sync status                              Show local + ahead/behind state.
+    sync log [--limit N]                     Recent sync commit history.
   import-claude-code [--source <path>] [--project <pat>] [--overwrite] [--dry-run]
                                            Walk ~/.claude/projects/*/memory/ and
                                            import each memory into the current store.

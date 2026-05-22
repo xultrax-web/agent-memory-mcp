@@ -5,6 +5,9 @@ dist/
 .agent-memory/
 .cli-test/
 .agent-memory-test/
+.test-machine1/
+.test-machine2/
+.test-remote.git/
 
 # mcp-publisher binary (downloaded per platform, not committed)
 mcp-publisher

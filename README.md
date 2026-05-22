@@ -200,6 +200,9 @@ Custom path:
 | `verify_memory`     | Re-evaluate a memory's claims. Extracts URLs/dates/file refs, flags stale-date signals, returns type-specific verification heuristics. Pairs with the `audit_stale` prompt. |
 | `find_backlinks`    | List memories that link to the given memory via `[[wiki-link]]` syntax in their bodies. Useful for "what references this" views.                                            |
 | `find_related`      | Surface memories related to one by combining outbound links, inbound backlinks, shared tags, type match, and content similarity. Navigates the memory graph by association. |
+| `sync_status`       | Report git-sync state: remote URL, branch, uncommitted local files, ahead/behind origin.                                                                                    |
+| `sync_push`         | Commit local memory changes + push to the configured git remote. Auto-timestamps the commit message if none given.                                                          |
+| `sync_pull`         | Fast-forward pull from the git remote. Refuses to pull if local changes are uncommitted.                                                                                    |
 
 ### Prompts
 
@@ -265,7 +268,43 @@ agent-memory save my-mem --type project --description "X" --content "Body" --tag
 agent-memory list --tags "production"          # filter by tag (intersection)
 agent-memory backlinks deploy-process          # memories that link to deploy-process
 agent-memory related deploy-process            # ranked discovery: links + tags + similarity
+agent-memory sync init git@github.com:you/agent-memory.git    # multi-machine setup (one-time)
+agent-memory sync push                         # commit + push local changes
+agent-memory sync pull                         # fast-forward from remote
+agent-memory sync status                       # local + ahead/behind state
 ```
+
+### Multi-machine memory (git sync)
+
+The killer feature for file-based memory: every dev machine has git, and markdown merges cleanly. `agent-memory sync` turns `.agent-memory/` into a git repo pointed at a (private) remote, and your memories follow you across desktop/laptop/server.
+
+```bash
+# One-time setup
+agent-memory sync init git@github.com:you/agent-memory.git
+
+# End of the day on desktop
+agent-memory sync push
+
+# Pick up your laptop before bed
+agent-memory sync pull
+
+# Save a new memory while reading in bed
+agent-memory save bedtime-thought --type project --description "..." --content "..."
+agent-memory sync push
+
+# Next morning at desktop
+agent-memory sync pull          # picks up the bedtime memory
+```
+
+What's NOT synced (per-machine state, kept local):
+
+- `.lock` — per-process file lock
+- `.events.jsonl` — per-machine audit trail
+- `.trash/` — soft-delete staging
+
+What IS synced: every memory file, the `MEMORY.md` index, and any `.gitignore` you add.
+
+Commits use the identity `agent-memory <agent-memory@local>` by default — set `GIT_AUTHOR_EMAIL` / `GIT_COMMITTER_EMAIL` in your environment if you want per-machine attribution.
 
 ### Audit log + structured logging
 
@@ -379,11 +418,21 @@ This server is built to be used daily, not to demo well once.
 - **`find_backlinks`** tool + `agent-memory backlinks <name>` CLI — "what links to this".
 - **`find_related`** tool + `agent-memory related <name>` CLI — combines outbound + inbound links, shared tags, type match, and content similarity into a ranked discovery view.
 
-**Landing in v0.9+:**
+**Shipped in v0.9 · the moat — multi-machine memory via git:**
 
-- Folder support (`.agent-memory/work/`, `.agent-memory/personal/`)
+- **`agent-memory sync init <remote-url>`** — convert `.agent-memory/` into a git repo, push to remote.
+- **`agent-memory sync push`** — auto-commit local changes + push.
+- **`agent-memory sync pull`** — fast-forward from remote.
+- **`agent-memory sync status`** — local state + commits ahead/behind origin.
+- **`agent-memory sync log`** — history of cross-machine memory changes.
+- **`sync_status` / `sync_push` / `sync_pull` MCP tools** — the LLM can do this too.
+- Per-machine state (`.lock`, `.events.jsonl`, `.trash/`) auto-excluded from sync.
+- Default commit identity injected (`agent-memory@local`) so machines without `git config --global user.email` work without setup.
+
+**Landing in v0.10+:**
+
 - TUI / web UI for browsing + editing memories in a clean interface
-- `agent-memory sync` for git-backed multi-machine memory (the moat)
+- Folder support (`.agent-memory/work/`, `.agent-memory/personal/`)
 - Memory packs for shareable curated bundles
 
 ---
