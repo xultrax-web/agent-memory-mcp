@@ -88,7 +88,12 @@ describe("CRP 1.1 · Ed25519 validation", () => {
       dir,
       `
       const r = mod.issueReceipt({ caveats: [] });
-      r.signature = r.signature.slice(0, -2) + "00";
+      // Flip one bit in the last byte · guaranteed-different signature
+      // (replacing with "00" was flaky · had 1/256 chance the original last
+      // byte already was 00, producing an identity 'tamper' that validated).
+      const lastByte = parseInt(r.signature.slice(-2), 16);
+      const flipped = (lastByte ^ 0x01).toString(16).padStart(2, '0');
+      r.signature = r.signature.slice(0, -2) + flipped;
       return mod.validateReceipt(r, {});
     `,
     ) as Record<string, unknown>;

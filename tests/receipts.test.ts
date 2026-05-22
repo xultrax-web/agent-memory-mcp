@@ -107,7 +107,13 @@ describe("Compliance Receipts · validation", () => {
       dir,
       `
       const r = mod.issueReceipt({ caveats: [] });
-      r.signature = r.signature.slice(0, -2) + "00";
+      // Flip one bit in the last byte · guaranteed-different signature
+      // (replacing with "00" had a 1/256 chance of being an identity op
+      // when the random last byte already was 00; bit-flip is always
+      // different).
+      const lastByte = parseInt(r.signature.slice(-2), 16);
+      const flipped = (lastByte ^ 0x01).toString(16).padStart(2, '0');
+      r.signature = r.signature.slice(0, -2) + flipped;
       return mod.validateReceipt(r, {});
     `,
     ) as Record<string, unknown>;

@@ -267,8 +267,11 @@ describe("delete_memory · receipt-gated path", () => {
     const check = JSON.parse(
       (checkResp[0] as { result: { content: [{ text: string }] } }).result.content[0].text,
     );
-    // Tamper signature
-    check.receipt.signature = check.receipt.signature.slice(0, -2) + "00";
+    // Tamper signature · bit-flip the last byte (guaranteed different;
+    // see receipts.test.ts for the 1/256 flakiness rationale).
+    const lastByte = parseInt(check.receipt.signature.slice(-2), 16);
+    const flipped = (lastByte ^ 0x01).toString(16).padStart(2, "0");
+    check.receipt.signature = check.receipt.signature.slice(0, -2) + flipped;
 
     const delResp = await runMcp(dir, [
       {
