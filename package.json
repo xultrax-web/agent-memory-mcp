@@ -1,7 +1,8 @@
 {
-  "name": "agent-memory-mcp",
+  "name": "@xultrax-web/agent-memory-mcp",
   "version": "0.1.0",
-  "description": "File-based persistent memory for any MCP client. Markdown + frontmatter. Inspired by Claude Code's built-in memory pattern, available to Cursor, Cline, Continue, and any other MCP-compatible tool.",
+  "mcpName": "io.github.xultrax-web/agent-memory-mcp",
+  "description": "Markdown memory for AI agents. Plain files you can read, edit, grep, and commit. The only MCP memory server that isn't a database.",
   "type": "module",
   "bin": {
     "agent-memory-mcp": "dist/index.js"
@@ -14,21 +15,38 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "mcp",
     "model-context-protocol",
+    "mcp-server",
     "memory",
+    "persistent-memory",
+    "markdown",
+    "file-based",
     "ai",
+    "ai-agents",
     "claude",
     "cursor",
     "cline",
-    "continue",
-    "persistent-memory",
-    "agent"
+    "continue-dev",
+    "claude-desktop",
+    "anthropic"
   ],
+  "homepage": "https://github.com/xultrax-web/agent-memory-mcp",
+  "bugs": {
+    "url": "https://github.com/xultrax-web/agent-memory-mcp/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xultrax-web/agent-memory-mcp.git"
+  },
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
     "gray-matter": "^4.0.3"
