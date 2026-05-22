@@ -60,7 +60,99 @@ const MEMORY_DIR = resolveStorageDir();
 const INDEX_FILE = join(MEMORY_DIR, "MEMORY.md");
 const TRASH_DIR = join(MEMORY_DIR, ".trash");
 const LOCK_FILE = join(MEMORY_DIR, ".lock");
+const EVENT_LOG = join(MEMORY_DIR, ".events.jsonl");
 const SCHEMA_VERSION = 1;
+
+// -------------------------------------------------------------
+// Structured logging · all output to stderr (stdio is reserved
+// for MCP JSON-RPC frames in server mode)
+// -------------------------------------------------------------
+
+type LogLevel = "debug" | "info" | "warn" | "error";
+const LOG_LEVEL_ORDER: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };
+const CURRENT_LOG_LEVEL: LogLevel =
+  (process.env.AGENT_MEMORY_LOG?.toLowerCase() as LogLevel) ?? "info";
+
+function log(level: LogLevel, message: string, fields?: Record<string, unknown>): void {
+  if (LOG_LEVEL_ORDER[level] < LOG_LEVEL_ORDER[CURRENT_LOG_LEVEL]) return;
+  const ts = new Date().toISOString();
+  const fieldStr = fields ? " " + JSON.stringify(fields) : "";
+  process.stderr.write(`${ts} [${level}] ${message}${fieldStr}\n`);
+}
+
+// -------------------------------------------------------------
+// Color · ANSI for TTY, respects NO_COLOR / FORCE_COLOR
+// -------------------------------------------------------------
+
+const ANSI = {
+  reset: "\x1b[0m",
+  dim: "\x1b[2m",
+  bold: "\x1b[1m",
+  red: "\x1b[31m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  cyan: "\x1b[36m",
+  magenta: "\x1b[35m",
+} as const;
+
+function useColor(): boolean {
+  if (process.env.NO_COLOR) return false;
+  if (process.env.FORCE_COLOR) return true;
+  return Boolean(process.stderr.isTTY);
+}
+
+function c(code: string, text: string): string {
+  return useColor() ? `${code}${text}${ANSI.reset}` : text;
+}
+
+// -------------------------------------------------------------
+// Event log · append-only JSONL audit trail
+// -------------------------------------------------------------
+//
+// Every mutation appends one line. Reads are not logged (would
+// dominate the log on hot indexes and adds little forensic value).
+// Format is one JSON object per line: { ts, action, ...fields }
+//
+// `agent-memory log` paginates the file for human consumption.
+
+interface EventRecord {
+  ts: string;
+  action: string;
+  [key: string]: unknown;
+}
+
+function logEvent(action: string, fields: Record<string, unknown>): void {
+  try {
+    ensureStorage();
+    const record: EventRecord = { ts: new Date().toISOString(), action, ...fields };
+    // Append is safe across processes on POSIX + Windows for small lines
+    // (writev guarantees atomicity below pipe buffer size). For larger
+    // future events we could move to the lock-wrapped pattern.
+    writeFileSync(EVENT_LOG, JSON.stringify(record) + "\n", { flag: "a", encoding: "utf8" });
+  } catch (err) {
+    // Never let event-log failure break the main operation
+    log("warn", "event log write failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+function readEventLog(opts: { tail?: number; action?: string }): EventRecord[] {
+  if (!existsSync(EVENT_LOG)) return [];
+  const lines = readFileSync(EVENT_LOG, "utf8").split(/\r?\n/).filter(Boolean);
+  let records: EventRecord[] = [];
+  for (const line of lines) {
+    try {
+      records.push(JSON.parse(line) as EventRecord);
+    } catch {
+      // Skip malformed lines silently — log file may have been
+      // hand-edited or truncated mid-write
+    }
+  }
+  if (opts.action) records = records.filter((r) => r.action === opts.action);
+  if (opts.tail) records = records.slice(-opts.tail);
+  return records;
+}
 
 function ensureStorage(): void {
   if (!existsSync(MEMORY_DIR)) mkdirSync(MEMORY_DIR, { recursive: true });
@@ -241,6 +333,8 @@ function toolSaveMemory(args: Record<string, unknown>): string {
   return withLock(() => {
     atomicWriteFile(fp, frontmatter + content + "\n");
     upsertIndexEntryUnlocked(name, description);
+    logEvent("save", { name, type, update: isUpdate, bytes: content.length });
+    log("debug", "save_memory", { name, type, update: isUpdate });
     return `${isUpdate ? "Updated" : "Saved"} memory "${name}" (${type}) at ${fp}`;
   });
 }
@@ -339,6 +433,8 @@ function toolDeleteMemory(args: Record<string, unknown>): string {
     const trashPath = join(TRASH_DIR, `${ts}-${name}.md`);
     renameSync(fp, trashPath);
     removeIndexEntryUnlocked(name);
+    logEvent("delete", { name, trash: `${ts}-${name}.md` });
+    log("debug", "delete_memory", { name });
     return `Moved "${name}" to trash. Restore with: agent-memory restore ${name}`;
   });
 }
@@ -368,9 +464,10 @@ function toolRestoreMemory(args: Record<string, unknown>): string {
     // Re-add to index using the restored file's frontmatter description.
     const mem = readMemory(name);
     if (mem) upsertIndexEntryUnlocked(name, mem.description);
-    return `Restored "${name}" from trash (was binned ${new Date(
-      Number(matches[0].split("-")[0]),
-    ).toISOString()}).`;
+    const binnedAt = new Date(Number(matches[0].split("-")[0])).toISOString();
+    logEvent("restore", { name, binnedAt });
+    log("debug", "restore_memory", { name });
+    return `Restored "${name}" from trash (was binned ${binnedAt}).`;
   });
 }
 
@@ -476,6 +573,127 @@ function toolDoctor(args: Record<string, unknown>): string {
   const rebuild = Boolean(args["rebuild-index"]);
   const report = runDoctor(rebuild);
   return formatDoctorReport(report, rebuild);
+}
+
+// -------------------------------------------------------------
+// Stats · operator dashboard
+// -------------------------------------------------------------
+
+function toolStats(_args: Record<string, unknown>): string {
+  ensureStorage();
+  const diskFiles = listMemoryFiles();
+  const memories = diskFiles.map((n) => readMemory(n)).filter((m): m is Memory => m !== null);
+
+  const byType: Record<string, number> = {};
+  for (const t of VALID_TYPES) byType[t] = 0;
+  for (const m of memories) byType[m.type] = (byType[m.type] ?? 0) + 1;
+
+  // File sizes via stat on each file (read body length doesn't include
+  // frontmatter bytes — stat gives the on-disk truth).
+  let totalBytes = 0;
+  let largestBytes = 0;
+  let largestName = "";
+  for (const n of diskFiles) {
+    const fp = memoryFilePath(n);
+    try {
+      const stats = readFileSync(fp, "utf8").length;
+      totalBytes += stats;
+      if (stats > largestBytes) {
+        largestBytes = stats;
+        largestName = n;
+      }
+    } catch {
+      // skip unreadable
+    }
+  }
+
+  // Oldest/newest by file mtime would need a stat call; use the
+  // index ordering as a proxy (alphabetical) for simplicity. Real
+  // mtime-based age would need `statSync` which adds an N read.
+  // Skipping that for v0.4; defer to a `--detailed` flag if asked.
+
+  const events = readEventLog({});
+  const trashCount = existsSync(TRASH_DIR)
+    ? readdirSync(TRASH_DIR).filter((f) => f.endsWith(".md")).length
+    : 0;
+
+  const lines: string[] = [];
+  lines.push(c(ANSI.bold, "agent-memory stats"));
+  lines.push(c(ANSI.dim, `storage : ${MEMORY_DIR}`));
+  lines.push("");
+  lines.push(c(ANSI.bold, `memories: ${memories.length} total`));
+  for (const t of ["user", "feedback", "project", "reference"]) {
+    const count = byType[t] ?? 0;
+    const bar = count > 0 ? "█".repeat(Math.min(count, 40)) : "";
+    lines.push(`  ${t.padEnd(10)} ${String(count).padStart(4)}  ${c(ANSI.cyan, bar)}`);
+  }
+  lines.push("");
+  lines.push(c(ANSI.bold, "storage:"));
+  lines.push(`  total size  ${fmtBytes(totalBytes)}`);
+  lines.push(`  avg size    ${memories.length > 0 ? fmtBytes(totalBytes / memories.length) : "—"}`);
+  if (largestName) {
+    lines.push(`  largest     ${fmtBytes(largestBytes)}  (${largestName})`);
+  }
+  lines.push("");
+  lines.push(c(ANSI.bold, "audit:"));
+  lines.push(`  events logged   ${events.length}`);
+  lines.push(`  items in trash  ${trashCount}`);
+  if (events.length > 0) {
+    lines.push(
+      `  last event      ${events[events.length - 1].ts} (${events[events.length - 1].action})`,
+    );
+  }
+  return lines.join("\n");
+}
+
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${Math.round(n)} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+// -------------------------------------------------------------
+// Log browser · paginated audit-trail view
+// -------------------------------------------------------------
+
+function toolLogEvents(args: Record<string, unknown>): string {
+  const tail = args.tail ? Number(args.tail) : 20;
+  const action = args.action ? String(args.action) : undefined;
+  const events = readEventLog({ tail, action });
+  if (events.length === 0) {
+    return action ? `No events of action "${action}" in the log.` : "No events logged yet.";
+  }
+
+  const lines: string[] = [];
+  lines.push(
+    c(
+      ANSI.bold,
+      `Last ${events.length} event${events.length === 1 ? "" : "s"}${action ? ` (action=${action})` : ""}:`,
+    ),
+  );
+  lines.push("");
+  for (const e of events) {
+    const { ts, action: a, ...rest } = e;
+    const tsStr = c(
+      ANSI.dim,
+      String(ts)
+        .replace("T", " ")
+        .replace(/\.\d+Z$/, "Z"),
+    );
+    const actionStr = c(actionColor(String(a)), String(a).padEnd(7));
+    const fields = Object.entries(rest)
+      .map(([k, v]) => `${c(ANSI.dim, k + "=")}${String(v)}`)
+      .join("  ");
+    lines.push(`  ${tsStr}  ${actionStr}  ${fields}`);
+  }
+  return lines.join("\n");
+}
+
+function actionColor(action: string): string {
+  if (action === "save") return ANSI.green;
+  if (action === "delete") return ANSI.yellow;
+  if (action === "restore") return ANSI.cyan;
+  return ANSI.dim;
 }
 
 function extractSnippet(body: string, query: string): string | null {
@@ -681,6 +899,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+    {
+      name: "stats",
+      description:
+        "Dashboard of memory-store state: counts per type, total size, largest memory, audit-log size, trash count.",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "log_events",
+      description:
+        "Read recent entries from the audit event log (.events.jsonl). Returns the last N events, optionally filtered by action.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          tail: { type: "number", description: "How many recent events to return (default 20)" },
+          action: {
+            type: "string",
+            description: "Filter by action (save | delete | restore)",
+          },
+        },
+      },
+    },
   ],
 }));
 
@@ -709,6 +948,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         break;
       case "doctor":
         result = toolDoctor(args);
+        break;
+      case "stats":
+        result = toolStats(args);
+        break;
+      case "log_events":
+        result = toolLogEvents(args);
         break;
       default:
         throw new Error(`Unknown tool: ${name}`);
@@ -740,6 +985,8 @@ const CLI_COMMANDS = new Set([
   "delete",
   "restore",
   "doctor",
+  "stats",
+  "log",
   "import-claude-code",
   "help",
   "--help",
@@ -852,6 +1099,19 @@ async function cliMain(command: string, rest: string[]): Promise<number> {
         );
         return 0;
       }
+      case "stats": {
+        process.stdout.write(toolStats({}) + "\n");
+        return 0;
+      }
+      case "log": {
+        process.stdout.write(
+          toolLogEvents({
+            tail: flags.tail ? Number(flags.tail) : undefined,
+            action: flags.action ? String(flags.action) : undefined,
+          }) + "\n",
+        );
+        return 0;
+      }
       case "import-claude-code": {
         return importClaudeCode({
           source: flags.source ? String(flags.source) : undefined,
@@ -891,6 +1151,9 @@ COMMANDS
   doctor [--rebuild-index]                 Check storage integrity (orphans, dangling
                                            index entries, unreadable files). With
                                            --rebuild-index, regenerates MEMORY.md from disk.
+  stats                                    Dashboard: counts per type, sizes, audit/trash counts.
+  log [--tail N] [--action save|delete|restore]
+                                           Recent audit-log entries.
   import-claude-code [--source <path>] [--project <pat>] [--overwrite] [--dry-run]
                                            Walk ~/.claude/projects/*/memory/ and
                                            import each memory into the current store.

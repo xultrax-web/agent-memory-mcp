@@ -193,6 +193,8 @@ Custom path:
 | `delete_memory`   | Soft delete: moves the memory to `.trash/<ts>-<name>.md`. Recoverable until you empty `.trash/` by hand.                                       |
 | `restore_memory`  | Restore a soft-deleted memory from `.trash/`. Picks the most recent trash entry for the name.                                                  |
 | `doctor`          | Storage integrity check. Reports orphans, dangling index entries, unreadable files. Pass `rebuild-index=true` to repair `MEMORY.md` from disk. |
+| `stats`           | Dashboard: counts per type, total size, largest memory, audit-log size, trash count.                                                           |
+| `log_events`      | Read recent entries from the audit event log. Optional `tail` (default 20) + `action` filter.                                                  |
 
 ### Memory types
 
@@ -219,7 +221,26 @@ agent-memory delete user-likes-tabs           # soft delete — moves to .trash/
 agent-memory restore user-likes-tabs          # restore the most recent trash entry
 agent-memory doctor                            # check integrity
 agent-memory doctor --rebuild-index            # repair MEMORY.md from disk
+agent-memory stats                             # dashboard: counts, sizes, audit/trash
+agent-memory log                               # last 20 entries from the audit log
+agent-memory log --tail 50 --action delete     # filter by action, tail size
 ```
+
+### Audit log + structured logging
+
+Every mutation appends one JSON line to `.agent-memory/.events.jsonl`:
+
+```jsonl
+{"ts":"2026-05-22T04:02:38.536Z","action":"save","name":"first-mem","type":"user","update":false,"bytes":6}
+{"ts":"2026-05-22T04:02:39.414Z","action":"delete","name":"second-mem","trash":"1779422559413-second-mem.md"}
+{"ts":"2026-05-22T04:02:39.712Z","action":"restore","name":"second-mem","binnedAt":"2026-05-22T04:02:39.413Z"}
+```
+
+Read it any way you want: `cat`, `jq`, the `log` / `log_events` tool, or a sidecar that ships it to your observability stack.
+
+Operational logging is separate. Set `AGENT_MEMORY_LOG=debug|info|warn|error` (default `info`) and structured lines stream to stderr — won't pollute the MCP stdio channel.
+
+Color output is on by default in TTYs. Set `NO_COLOR=1` to disable, `FORCE_COLOR=1` to force-enable in pipes.
 
 Multi-line content can come from a file or stdin:
 
@@ -282,14 +303,21 @@ This server is built to be used daily, not to demo well once.
 - **Schema versioning** — every memory file gets a `schema: 1` field so future format changes can migrate cleanly.
 - **Spec-compliant Resources** — `agent-memory://index` + `agent-memory://memory/{name}`; clients can pin them as always-visible context.
 
-**Landing in v0.4 - v0.7:**
+**Shipped in v0.4:**
 
-- Structured event log at `.events.jsonl` (audit trail of every read/write)
-- `agent-memory stats` (counts by type, size, oldest/newest, last-accessed distribution)
-- Color output, dry-run flags on every mutating CLI command
+- **Append-only event log** at `.events.jsonl` — every mutation timestamped + JSON-structured for audit.
+- **`agent-memory stats`** — dashboard of counts per type, total/avg/largest size, audit + trash counts.
+- **`agent-memory log`** — paginated browser of the event log, filterable by action.
+- **Structured stderr logging** — `AGENT_MEMORY_LOG=debug|info|warn|error`; safe to use alongside MCP stdio.
+- **Color output** — auto-detected via TTY, respects `NO_COLOR` / `FORCE_COLOR`.
+
+**Landing in v0.5 - v0.7:**
+
 - Read-only mode (`AGENT_MEMORY_READ_ONLY=1`)
 - Fuse.js fuzzy search + BM25 ranking + snippet highlighting
+- `relevant_memories(query, max=5)` smart auto-context tool
 - Comprehensive Vitest suite + CI matrix
+- Multi-client compatibility verification (Cursor, Cline, Claude Desktop, Continue)
 
 ---
 
