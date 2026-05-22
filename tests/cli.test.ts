@@ -33,7 +33,7 @@ describe("CLI · roundtrip", () => {
 
     const get = runCli(dir, ["get", "test-mem"]);
     expect(get.exitCode).toBe(0);
-    expect(get.stdout).toContain("type: user");
+    expect(get.stdout).toMatch(/type\s+:\s+user/);
     expect(get.stdout).toContain("Body.");
 
     const search = runCli(dir, ["search", "test"]);
@@ -325,6 +325,100 @@ describe("CLI · verify + conflict detection", () => {
       "Body 2.",
     ]);
     expect(r.stdout).not.toContain("WARNING");
+  });
+});
+
+describe("CLI · tags + backlinks + related", () => {
+  beforeEach(() => {
+    runCli(dir, [
+      "save",
+      "deploy-process",
+      "--type",
+      "project",
+      "--description",
+      "Blue-green prod deployment",
+      "--content",
+      "See [[runbook-checklist]] for steps.",
+      "--tags",
+      "deployment,production,critical",
+    ]);
+    runCli(dir, [
+      "save",
+      "runbook-checklist",
+      "--type",
+      "reference",
+      "--description",
+      "Pre-deploy checklist",
+      "--content",
+      "Verify [[deploy-process]] is green.",
+      "--tags",
+      "deployment,production",
+    ]);
+    runCli(dir, [
+      "save",
+      "user-likes-tabs",
+      "--type",
+      "user",
+      "--description",
+      "Tabs preference",
+      "--content",
+      "Body.",
+      "--tags",
+      "preference",
+    ]);
+  });
+
+  test("list shows tags inline", () => {
+    const r = runCli(dir, ["list"]);
+    expect(r.stdout).toContain("· deployment · production · critical");
+    expect(r.stdout).toContain("· preference");
+  });
+
+  test("list --tags filters to matching memories (intersection)", () => {
+    const r = runCli(dir, ["list", "--tags", "production"]);
+    expect(r.stdout).toContain("deploy-process");
+    expect(r.stdout).toContain("runbook-checklist");
+    expect(r.stdout).not.toContain("user-likes-tabs");
+  });
+
+  test("get shows tags line", () => {
+    const r = runCli(dir, ["get", "deploy-process"]);
+    expect(r.stdout).toContain("tags        : deployment, production, critical");
+  });
+
+  test("backlinks finds memories linking via [[wiki-link]]", () => {
+    const r = runCli(dir, ["backlinks", "deploy-process"]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("runbook-checklist");
+  });
+
+  test("backlinks returns no-match message when nothing links to memory", () => {
+    const r = runCli(dir, ["backlinks", "user-likes-tabs"]);
+    expect(r.stdout).toContain("No memories link to");
+  });
+
+  test("related ranks linked + shared-tag memories highest", () => {
+    const r = runCli(dir, ["related", "deploy-process"]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("runbook-checklist");
+    expect(r.stdout).toMatch(/linked from this memory|links to this memory|shared tags/);
+  });
+
+  test("save rejects invalid tag format", () => {
+    const r = runCli(dir, [
+      "save",
+      "bad-tag-test",
+      "--type",
+      "user",
+      "--description",
+      "x",
+      "--content",
+      "y",
+      "--tags",
+      "BAD TAG",
+    ]);
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("Invalid tag");
   });
 });
 

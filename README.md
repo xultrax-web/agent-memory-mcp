@@ -198,6 +198,8 @@ Custom path:
 | `stats`             | Dashboard: counts per type, total size, largest memory, audit-log size, trash count.                                                                                        |
 | `log_events`        | Read recent entries from the audit event log. Optional `tail` (default 20) + `action` filter.                                                                               |
 | `verify_memory`     | Re-evaluate a memory's claims. Extracts URLs/dates/file refs, flags stale-date signals, returns type-specific verification heuristics. Pairs with the `audit_stale` prompt. |
+| `find_backlinks`    | List memories that link to the given memory via `[[wiki-link]]` syntax in their bodies. Useful for "what references this" views.                                            |
+| `find_related`      | Surface memories related to one by combining outbound links, inbound backlinks, shared tags, type match, and content similarity. Navigates the memory graph by association. |
 
 ### Prompts
 
@@ -218,6 +220,23 @@ Four built-in types, matching the Claude Code convention:
 - **feedback** — rules the assistant should follow (do this, don't do that)
 - **project** — current-state context that isn't in the code (deadlines, in-flight work)
 - **reference** — pointers to external systems (Linear board URL, monitoring dashboard)
+
+### Tags + wiki-links
+
+Beyond types, two cross-cutting organization features:
+
+**Tags** — optional `tags: [a, b, c]` array in frontmatter. Queryable via `list_memories({tags: [...]})` and the `agent-memory list --tags "a,b"` CLI. Filter is intersection — memories must have all listed tags. Tag names are lowercase a-z + digits + hyphen/underscore, max 40 chars.
+
+```markdown
+---
+name: deploy-process
+description: Blue-green prod deployment
+type: project
+tags: [deployment, production, critical]
+---
+```
+
+**Wiki-links** — write `[[memory-name]]` anywhere in a memory body and it becomes a link. `find_backlinks` returns memories that reference a given one; `find_related` ranks the full graph (outbound links, inbound backlinks, shared tags, content similarity) for discovery navigation.
 
 ---
 
@@ -242,6 +261,10 @@ agent-memory stats                             # dashboard: counts, sizes, audit
 agent-memory log                               # last 20 entries from the audit log
 agent-memory log --tail 50 --action delete     # filter by action, tail size
 agent-memory verify deploy-process             # extract URLs/dates/file refs + staleness heuristics
+agent-memory save my-mem --type project --description "X" --content "Body" --tags "production,critical"
+agent-memory list --tags "production"          # filter by tag (intersection)
+agent-memory backlinks deploy-process          # memories that link to deploy-process
+agent-memory related deploy-process            # ranked discovery: links + tags + similarity
 ```
 
 ### Audit log + structured logging
@@ -349,9 +372,16 @@ This server is built to be used daily, not to demo well once.
 - **`verify_memory` tool** — static analysis of a memory's URLs/dates/file refs with type-specific staleness heuristics. Plus the matching `agent-memory verify <name>` CLI.
 - **Conflict detection on save** — fuzzy-matches new memories against existing ones; warns on near-duplicates without blocking the save (so the LLM can decide whether to merge, rename, or proceed).
 
-**Landing in v0.8 - v0.9:**
+**Shipped in v0.8 · organization at scale:**
 
-- Tags + wiki-links + folder support + `find_related` (organization-at-scale)
+- **Tags** — optional `tags: [...]` array in frontmatter. Queryable via `list_memories` and `agent-memory list --tags "a,b"`. Intersection filter.
+- **`[[wiki-links]]`** — write `[[memory-name]]` in any memory body, auto-detected.
+- **`find_backlinks`** tool + `agent-memory backlinks <name>` CLI — "what links to this".
+- **`find_related`** tool + `agent-memory related <name>` CLI — combines outbound + inbound links, shared tags, type match, and content similarity into a ranked discovery view.
+
+**Landing in v0.9+:**
+
+- Folder support (`.agent-memory/work/`, `.agent-memory/personal/`)
 - TUI / web UI for browsing + editing memories in a clean interface
 - `agent-memory sync` for git-backed multi-machine memory (the moat)
 - Memory packs for shareable curated bundles

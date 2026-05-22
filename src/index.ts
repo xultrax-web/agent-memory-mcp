@@ -224,15 +224,25 @@ interface MemoryFrontmatter {
   name: string;
   description: string;
   type: string;
+  tags?: string[];
 }
 
 interface Memory {
   name: string;
   description: string;
   type: string;
+  tags: string[];
   body: string;
   filePath: string;
 }
+
+// Tags: lowercase, digits, hyphen/underscore. Max 40 chars per tag.
+// Same alphabet as slugs but shorter — meant for "container-industry",
+// "weekly", "deprecated", etc.
+const TAG_PATTERN = /^[a-z0-9][a-z0-9_-]{0,40}$/;
+
+// Wiki-links: [[memory-name]] · names follow SLUG_PATTERN rules
+const WIKI_LINK_PATTERN = /\[\[([a-z0-9][a-z0-9_-]{0,80})\]\]/g;
 
 function memoryFilePath(name: string): string {
   return join(MEMORY_DIR, `${name}.md`);
@@ -248,6 +258,7 @@ function readMemory(name: string): Memory | null {
     name: fm.name ?? name,
     description: fm.description ?? "",
     type: fm.type ?? "project",
+    tags: Array.isArray(fm.tags) ? fm.tags.filter((t): t is string => typeof t === "string") : [],
     body: parsed.content.trim(),
     filePath: fp,
   };
@@ -258,6 +269,48 @@ function listMemoryFiles(): string[] {
   return readdirSync(MEMORY_DIR)
     .filter((f) => f.endsWith(".md") && f !== "MEMORY.md")
     .map((f) => f.replace(/\.md$/, ""));
+}
+
+// Tags can arrive as a string array (MCP/CLI args) or a comma-separated
+// string (CLI flag). Normalize to a deduped lowercase string[] preserving
+// order of first appearance.
+function normalizeTags(input: unknown): string[] {
+  if (!input) return [];
+  let raw: string[];
+  if (Array.isArray(input)) {
+    raw = input.map((t) => String(t).trim()).filter((t) => t.length > 0);
+  } else if (typeof input === "string") {
+    raw = input
+      .split(",")
+      .map((t) => t.trim())
+      .filter((t) => t.length > 0);
+  } else {
+    return [];
+  }
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const t of raw) {
+    const lower = t.toLowerCase();
+    if (!seen.has(lower)) {
+      seen.add(lower);
+      out.push(lower);
+    }
+  }
+  return out;
+}
+
+// Extract [[wiki-link]] targets from a memory body. Returns the set of
+// referenced memory names (deduped, lowercase). Self-references stripped.
+function extractWikiLinks(body: string, selfName: string): string[] {
+  const found = new Set<string>();
+  let m: RegExpExecArray | null;
+  // RegExp with /g flag needs reset of lastIndex per call
+  WIKI_LINK_PATTERN.lastIndex = 0;
+  while ((m = WIKI_LINK_PATTERN.exec(body)) !== null) {
+    const target = m[1].toLowerCase();
+    if (target !== selfName) found.add(target);
+  }
+  return Array.from(found);
 }
 
 // -------------------------------------------------------------
@@ -307,6 +360,7 @@ function toolSaveMemory(args: Record<string, unknown>): string {
   const description = String(args.description ?? "").trim();
   const type = String(args.type ?? "project").trim();
   const content = String(args.content ?? "").trim();
+  const tags = normalizeTags(args.tags);
 
   if (!SLUG_PATTERN.test(name)) {
     throw new Error(
@@ -318,16 +372,26 @@ function toolSaveMemory(args: Record<string, unknown>): string {
       `Invalid type "${type}". Must be one of: ${Array.from(VALID_TYPES).join(", ")}.`,
     );
   }
+  for (const tag of tags) {
+    if (!TAG_PATTERN.test(tag)) {
+      throw new Error(
+        `Invalid tag "${tag}". Tags use lowercase (a-z, 0-9, hyphen, underscore), 1-40 chars.`,
+      );
+    }
+  }
   if (!description) throw new Error("description is required");
   if (!content) throw new Error("content is required");
 
   ensureStorage();
 
+  const tagsLine =
+    tags.length > 0 ? `tags: [${tags.map((t) => JSON.stringify(t)).join(", ")}]\n` : "";
   const frontmatter =
     `---\n` +
     `name: ${name}\n` +
     `description: ${JSON.stringify(description)}\n` +
     `type: ${type}\n` +
+    tagsLine +
     `schema: ${SCHEMA_VERSION}\n` +
     `---\n\n`;
   const fp = memoryFilePath(name);
@@ -437,17 +501,22 @@ function toolGetMemory(args: Record<string, unknown>): string {
   const name = String(args.name ?? "").trim();
   const mem = readMemory(name);
   if (!mem) return `Memory "${name}" not found.`;
+  const tagsLine = mem.tags.length > 0 ? `tags        : ${mem.tags.join(", ")}` : "";
   return [
     `# ${mem.name}`,
-    `type: ${mem.type}`,
-    `description: ${mem.description}`,
+    `type        : ${mem.type}`,
+    tagsLine,
+    `description : ${mem.description}`,
     "",
     mem.body,
-  ].join("\n");
+  ]
+    .filter((l) => l !== "")
+    .join("\n");
 }
 
 function toolListMemories(args: Record<string, unknown>): string {
   const typeFilter = args.type ? String(args.type) : null;
+  const tagFilter = normalizeTags(args.tags);
   const offset = args.offset ? Math.max(0, Number(args.offset)) : 0;
   const limit = args.limit ? Math.max(1, Number(args.limit)) : 50;
 
@@ -456,24 +525,35 @@ function toolListMemories(args: Record<string, unknown>): string {
     .map((n) => readMemory(n))
     .filter((m): m is Memory => m !== null)
     .filter((m) => !typeFilter || m.type === typeFilter)
+    .filter((m) => tagFilter.length === 0 || tagFilter.every((t) => m.tags.includes(t)))
     .sort((a, b) => a.name.localeCompare(b.name));
 
   if (all.length === 0) {
-    return typeFilter
-      ? `No memories of type "${typeFilter}".`
+    const parts: string[] = [];
+    if (typeFilter) parts.push(`type "${typeFilter}"`);
+    if (tagFilter.length > 0) parts.push(`tags [${tagFilter.join(", ")}]`);
+    return parts.length > 0
+      ? `No memories matching ${parts.join(" and ")}.`
       : "No memories yet. Use save_memory to create one.";
   }
 
   const page = all.slice(offset, offset + limit);
   const lines: string[] = [];
+  const filterDesc = [
+    typeFilter ? `type=${typeFilter}` : null,
+    tagFilter.length > 0 ? `tags=[${tagFilter.join(",")}]` : null,
+  ]
+    .filter(Boolean)
+    .join(" ");
   const showing =
     offset === 0 && page.length === all.length
-      ? `Found ${all.length} memor${all.length === 1 ? "y" : "ies"}:`
-      : `Showing ${offset + 1}-${offset + page.length} of ${all.length}:`;
+      ? `Found ${all.length} memor${all.length === 1 ? "y" : "ies"}${filterDesc ? ` (${filterDesc})` : ""}:`
+      : `Showing ${offset + 1}-${offset + page.length} of ${all.length}${filterDesc ? ` (${filterDesc})` : ""}:`;
   lines.push(showing);
   lines.push("");
   for (const m of page) {
-    lines.push(`  ${m.name}  [${m.type}]`);
+    const tagSuffix = m.tags.length > 0 ? `  ${c(ANSI.dim, `· ${m.tags.join(" · ")}`)}` : "";
+    lines.push(`  ${m.name}  [${m.type}]${tagSuffix}`);
     lines.push(`    ${m.description}`);
   }
   if (offset + page.length < all.length) {
@@ -860,6 +940,159 @@ function toolVerifyMemory(args: Record<string, unknown>): string {
 }
 
 // -------------------------------------------------------------
+// Backlinks · which memories link to this one via [[wiki-link]]
+// -------------------------------------------------------------
+
+function toolFindBacklinks(args: Record<string, unknown>): string {
+  const name = String(args.name ?? "").trim();
+  if (!SLUG_PATTERN.test(name)) throw new Error(`Invalid name "${name}".`);
+
+  const target = name.toLowerCase();
+  const all = listMemoryFiles()
+    .map((n) => readMemory(n))
+    .filter((m): m is Memory => m !== null);
+
+  const backlinks: Memory[] = [];
+  for (const m of all) {
+    if (m.name === name) continue;
+    const links = extractWikiLinks(m.body, m.name);
+    if (links.includes(target)) backlinks.push(m);
+  }
+
+  if (backlinks.length === 0) return `No memories link to [[${name}]].`;
+
+  const lines: string[] = [];
+  lines.push(
+    c(
+      ANSI.bold,
+      `Found ${backlinks.length} memor${backlinks.length === 1 ? "y" : "ies"} linking to [[${name}]]:`,
+    ),
+  );
+  lines.push("");
+  for (const m of backlinks.sort((a, b) => a.name.localeCompare(b.name))) {
+    lines.push(`  ${m.name}  [${m.type}]`);
+    lines.push(`    ${m.description}`);
+  }
+  return lines.join("\n");
+}
+
+// -------------------------------------------------------------
+// find_related · the discovery layer
+// -------------------------------------------------------------
+//
+// Surfaces memories related to a given one via three signals:
+//   1. Wiki-links     · outbound [[refs]] from this memory
+//   2. Backlinks      · memories that link TO this one
+//   3. Shared tags    · memories sharing ≥1 tag
+//   4. Content sim    · Fuse score against name + description
+// Each signal contributes points; results ranked by total score.
+
+interface RelatedHit {
+  name: string;
+  type: string;
+  tags: string[];
+  description: string;
+  score: number;
+  reasons: string[];
+}
+
+function toolFindRelated(args: Record<string, unknown>): string {
+  const name = String(args.name ?? "").trim();
+  if (!SLUG_PATTERN.test(name)) throw new Error(`Invalid name "${name}".`);
+  const mem = readMemory(name);
+  if (!mem) return `Memory "${name}" not found.`;
+
+  const max = args.max ? Math.max(1, Math.min(20, Number(args.max))) : 8;
+
+  const others = listMemoryFiles()
+    .filter((n) => n !== name)
+    .map((n) => readMemory(n))
+    .filter((m): m is Memory => m !== null);
+
+  if (others.length === 0) return `No other memories to compare against.`;
+
+  const outbound = new Set(extractWikiLinks(mem.body, mem.name));
+  const myTags = new Set(mem.tags);
+
+  // Fuzzy similarity against name + description only (body content is
+  // too noisy for relatedness; we already cover semantic overlap via
+  // search_memories).
+  const fuse = new Fuse(others, {
+    includeScore: true,
+    threshold: 0.7,
+    ignoreLocation: true,
+    minMatchCharLength: 3,
+    keys: [
+      { name: "name", weight: 2 },
+      { name: "description", weight: 1 },
+    ],
+  });
+  const fuzzy = new Map<string, number>();
+  const query = `${mem.name} ${mem.description}`;
+  for (const r of fuse.search(query, { limit: 20 })) {
+    fuzzy.set(r.item.name, 1 - (r.score ?? 1));
+  }
+
+  const scored = new Map<string, RelatedHit>();
+  for (const other of others) {
+    let score = 0;
+    const reasons: string[] = [];
+
+    if (outbound.has(other.name)) {
+      score += 5;
+      reasons.push("linked from this memory");
+    }
+    const otherOutbound = extractWikiLinks(other.body, other.name);
+    if (otherOutbound.includes(mem.name)) {
+      score += 5;
+      reasons.push("links to this memory");
+    }
+    const sharedTags = other.tags.filter((t) => myTags.has(t));
+    if (sharedTags.length > 0) {
+      score += sharedTags.length * 3;
+      reasons.push(`shared tags: ${sharedTags.join(", ")}`);
+    }
+    if (other.type === mem.type) {
+      score += 1;
+    }
+    const sim = fuzzy.get(other.name);
+    if (sim && sim > 0.3) {
+      score += Math.round(sim * 4);
+      reasons.push(`content similarity ${Math.round(sim * 100)}%`);
+    }
+
+    if (score > 0) {
+      scored.set(other.name, {
+        name: other.name,
+        type: other.type,
+        tags: other.tags,
+        description: other.description,
+        score,
+        reasons,
+      });
+    }
+  }
+
+  const ranked = Array.from(scored.values())
+    .sort((a, b) => b.score - a.score)
+    .slice(0, max);
+
+  if (ranked.length === 0) return `No memories related to "${name}" found.`;
+
+  const lines: string[] = [];
+  lines.push(c(ANSI.bold, `Memories related to ${name}:`));
+  lines.push("");
+  for (const r of ranked) {
+    lines.push(`  ${r.name}  [${r.type}]  ${c(ANSI.dim, `· score ${r.score}`)}`);
+    lines.push(`    ${r.description}`);
+    for (const reason of r.reasons) {
+      lines.push(`    ${c(ANSI.dim, `· ${reason}`)}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+// -------------------------------------------------------------
 // Stats · operator dashboard
 // -------------------------------------------------------------
 
@@ -985,7 +1218,7 @@ function actionColor(action: string): string {
 // -------------------------------------------------------------
 
 const server = new Server(
-  { name: "agent-memory", version: "0.7.0" },
+  { name: "agent-memory", version: "0.8.0" },
   { capabilities: { tools: {}, resources: {}, prompts: {} } },
 );
 
@@ -1280,6 +1513,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             description:
               "Markdown body. For feedback/project, include **Why:** and **How to apply:** lines.",
           },
+          tags: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "Optional tags for cross-cutting categorization. Lowercase, kebab/underscore, max 40 chars each. Queryable in list_memories + search_memories.",
+          },
         },
         required: ["name", "description", "type", "content"],
       },
@@ -1329,7 +1568,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "list_memories",
-      description: "List stored memories, optionally filtered by type. Paginated.",
+      description: "List stored memories, optionally filtered by type and/or tags. Paginated.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1337,6 +1576,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             enum: ["user", "feedback", "project", "reference"],
             description: "Optional filter — only list memories of this type",
+          },
+          tags: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "Optional tag filter — memories must have ALL listed tags (intersection). Can also be passed as a comma-separated string.",
           },
           offset: { type: "number", description: "Skip this many results (default 0)." },
           limit: { type: "number", description: "Max results per page (default 50)." },
@@ -1414,6 +1659,34 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["name"],
       },
     },
+    {
+      name: "find_backlinks",
+      description:
+        "List memories that link to the given memory via [[wiki-link]] syntax in their bodies. Useful for building a 'what references this' view.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "The memory's name slug" },
+        },
+        required: ["name"],
+      },
+    },
+    {
+      name: "find_related",
+      description:
+        "Surface memories related to a given one. Ranks by combining: outbound [[wiki-links]], inbound backlinks, shared tags, same type, and content similarity (name + description). Use this to navigate the memory graph by association rather than by exact lookup.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "The starting memory's name slug" },
+          max: {
+            type: "number",
+            description: "Max related memories to return (default 8, capped at 20).",
+          },
+        },
+        required: ["name"],
+      },
+    },
   ],
 }));
 
@@ -1455,6 +1728,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "verify_memory":
         result = toolVerifyMemory(args);
         break;
+      case "find_backlinks":
+        result = toolFindBacklinks(args);
+        break;
+      case "find_related":
+        result = toolFindRelated(args);
+        break;
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
@@ -1489,6 +1768,8 @@ const CLI_COMMANDS = new Set([
   "stats",
   "log",
   "verify",
+  "backlinks",
+  "related",
   "import-claude-code",
   "help",
   "--help",
@@ -1563,6 +1844,7 @@ async function cliMain(command: string, rest: string[]): Promise<number> {
           type: String(flags.type ?? "project"),
           description: String(flags.description ?? ""),
           content,
+          tags: flags.tags,
         });
         process.stdout.write(result + "\n");
         return 0;
@@ -1599,6 +1881,7 @@ async function cliMain(command: string, rest: string[]): Promise<number> {
         process.stdout.write(
           toolListMemories({
             type: flags.type,
+            tags: flags.tags,
             offset: flags.offset ? Number(flags.offset) : undefined,
             limit: flags.limit ? Number(flags.limit) : undefined,
           }) + "\n",
@@ -1631,6 +1914,23 @@ async function cliMain(command: string, rest: string[]): Promise<number> {
         const name = positional[0];
         if (!name) throw new Error("Usage: agent-memory verify <name>");
         process.stdout.write(toolVerifyMemory({ name }) + "\n");
+        return 0;
+      }
+      case "backlinks": {
+        const name = positional[0];
+        if (!name) throw new Error("Usage: agent-memory backlinks <name>");
+        process.stdout.write(toolFindBacklinks({ name }) + "\n");
+        return 0;
+      }
+      case "related": {
+        const name = positional[0];
+        if (!name) throw new Error("Usage: agent-memory related <name> [--max N]");
+        process.stdout.write(
+          toolFindRelated({
+            name,
+            max: flags.max ? Number(flags.max) : undefined,
+          }) + "\n",
+        );
         return 0;
       }
       case "log": {
@@ -1669,15 +1969,17 @@ USAGE
   agent-memory-mcp                         MCP server mode (default when no args)
 
 COMMANDS
-  save <name> --type <t> --description <d> --content <c>
+  save <name> --type <t> --description <d> --content <c> [--tags "a,b,c"]
                                            Save or update a memory.
                                            Type: user | feedback | project | reference
                                            Content sources: --content "..." | --content-file <path> | --stdin
+                                           Tags: comma-separated, lowercase, max 40 chars each.
   search <query> [--limit N]               Fuzzy search (typo-tolerant), top N (default 10)
   relevant <query> [--max N]               Top N matches as full markdown for LLM ingestion
   get <name>                               Print one memory's full contents
-  list [--type <t>] [--offset N] [--limit N]
+  list [--type <t>] [--tags "a,b"] [--offset N] [--limit N]
                                            List memories (paginated, default limit 50)
+                                           Tag filter requires ALL listed tags (intersection).
   delete <name>                            Soft-delete: move to .trash/, removable later
   restore <name>                           Restore the most recent trash entry for <name>
   doctor [--rebuild-index]                 Check storage integrity (orphans, dangling
@@ -1689,6 +1991,9 @@ COMMANDS
   verify <name>                            Re-evaluate a memory's claims (URLs, dates, file refs,
                                            type-specific staleness heuristics). Static analysis;
                                            no network calls.
+  backlinks <name>                         List memories that link to <name> via [[wiki-links]].
+  related <name> [--max N]                 Surface related memories via outbound + inbound links,
+                                           shared tags, type match, content similarity.
   import-claude-code [--source <path>] [--project <pat>] [--overwrite] [--dry-run]
                                            Walk ~/.claude/projects/*/memory/ and
                                            import each memory into the current store.
