@@ -69,7 +69,7 @@ If you want vector similarity search, semantic recall, or auto-relation extracti
 npx -y github:xultrax-web/agent-memory-mcp
 ```
 
-### From npm (after v0.2.0 ships)
+### From npm (once published — landing v0.4.0)
 
 ```bash
 npx -y @xultrax-web/agent-memory-mcp
@@ -184,13 +184,15 @@ Custom path:
 
 ## Tools
 
-| Tool              | Purpose                                                                                 |
-| ----------------- | --------------------------------------------------------------------------------------- |
-| `save_memory`     | Create or update a memory. Validates the name (kebab-case) and type. Updates the index. |
-| `search_memories` | Substring search across name, description, and body. Returns top 10 by relevance score. |
-| `get_memory`      | Fetch one memory by name. Returns frontmatter + body.                                   |
-| `list_memories`   | List all memories. Optional `type` filter.                                              |
-| `delete_memory`   | Remove a memory file and its index entry.                                               |
+| Tool              | Purpose                                                                                                                                        |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `save_memory`     | Create or update a memory. Atomic write + locked. Validates name + type. Updates the index.                                                    |
+| `search_memories` | Substring search across name, description, and body. Returns top 10 by relevance score.                                                        |
+| `get_memory`      | Fetch one memory by name. Returns frontmatter + body.                                                                                          |
+| `list_memories`   | List all memories. Optional `type` filter.                                                                                                     |
+| `delete_memory`   | Soft delete: moves the memory to `.trash/<ts>-<name>.md`. Recoverable until you empty `.trash/` by hand.                                       |
+| `restore_memory`  | Restore a soft-deleted memory from `.trash/`. Picks the most recent trash entry for the name.                                                  |
+| `doctor`          | Storage integrity check. Reports orphans, dangling index entries, unreadable files. Pass `rebuild-index=true` to repair `MEMORY.md` from disk. |
 
 ### Memory types
 
@@ -213,7 +215,10 @@ agent-memory list
 agent-memory list --type feedback
 agent-memory search "tabs"
 agent-memory get user-likes-tabs
-agent-memory delete user-likes-tabs
+agent-memory delete user-likes-tabs           # soft delete — moves to .trash/
+agent-memory restore user-likes-tabs          # restore the most recent trash entry
+agent-memory doctor                            # check integrity
+agent-memory doctor --rebuild-index            # repair MEMORY.md from disk
 ```
 
 Multi-line content can come from a file or stdin:
@@ -266,17 +271,25 @@ For most workflows that's a good trade. For some it isn't. Pick the right tool.
 
 ## Operator-grade by design
 
-This server is built to be used daily, not to demo well once. v1.0 includes:
+This server is built to be used daily, not to demo well once.
 
-- **Atomic writes** — no partial writes if power dies
-- **Soft delete** — `delete_memory` moves to `.trash/`, restore command available
-- **Index recovery** — `agent-memory doctor` rebuilds `MEMORY.md` if it diverges
-- **Read-only mode** — `AGENT_MEMORY_READ_ONLY=1` for shared/published stores
-- **Event log** — every read/write goes to `.events.jsonl` for audit
-- **No silent failures** — every error includes a remediation
-- **Spec-compliant** — implements MCP Resources alongside Tools; clients can pin the memory index as always-visible context
+**Shipped in v0.3:**
 
-(Some of these land in v0.2-v0.7 over the next two weeks. Check [CHANGELOG.md](CHANGELOG.md) for current shipped features.)
+- **Atomic writes** — tmp-file + rename pattern. Power-loss never leaves a half-written file.
+- **File locking** — `proper-lockfile` around every mutation. Concurrent MCP server + CLI access can't corrupt the index.
+- **Soft delete** — `delete_memory` moves to `.trash/<timestamp>-<name>.md`. `restore_memory` brings it back.
+- **Index recovery** — `agent-memory doctor` reports orphan files, dangling entries, and parse errors. `--rebuild-index` rewrites `MEMORY.md` from disk.
+- **Schema versioning** — every memory file gets a `schema: 1` field so future format changes can migrate cleanly.
+- **Spec-compliant Resources** — `agent-memory://index` + `agent-memory://memory/{name}`; clients can pin them as always-visible context.
+
+**Landing in v0.4 - v0.7:**
+
+- Structured event log at `.events.jsonl` (audit trail of every read/write)
+- `agent-memory stats` (counts by type, size, oldest/newest, last-accessed distribution)
+- Color output, dry-run flags on every mutating CLI command
+- Read-only mode (`AGENT_MEMORY_READ_ONLY=1`)
+- Fuse.js fuzzy search + BM25 ranking + snippet highlighting
+- Comprehensive Vitest suite + CI matrix
 
 ---
 

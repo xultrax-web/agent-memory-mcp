@@ -36,11 +36,12 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
-  unlinkSync,
+  renameSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import lockfile from "proper-lockfile";
 
 // -------------------------------------------------------------
 // Storage location resolution
@@ -57,6 +58,9 @@ function resolveStorageDir(): string {
 
 const MEMORY_DIR = resolveStorageDir();
 const INDEX_FILE = join(MEMORY_DIR, "MEMORY.md");
+const TRASH_DIR = join(MEMORY_DIR, ".trash");
+const LOCK_FILE = join(MEMORY_DIR, ".lock");
+const SCHEMA_VERSION = 1;
 
 function ensureStorage(): void {
   if (!existsSync(MEMORY_DIR)) mkdirSync(MEMORY_DIR, { recursive: true });
@@ -66,6 +70,48 @@ function ensureStorage(): void {
       "# Memory Index\n\n_Auto-managed by agent-memory-mcp. Hand-edits to entries are preserved._\n\n",
       "utf8",
     );
+  }
+}
+
+function ensureTrash(): void {
+  if (!existsSync(TRASH_DIR)) mkdirSync(TRASH_DIR, { recursive: true });
+}
+
+function ensureLockTarget(): void {
+  ensureStorage();
+  // proper-lockfile needs the target file to exist before locking
+  if (!existsSync(LOCK_FILE)) writeFileSync(LOCK_FILE, "", "utf8");
+}
+
+// -------------------------------------------------------------
+// Reliability primitives
+// -------------------------------------------------------------
+//
+// Every mutation goes through these two helpers:
+//   atomicWriteFile · tmp-file + rename, so power-loss never leaves
+//                     a half-written file on disk
+//   withLock        · proper-lockfile around any write transaction,
+//                     so MCP server + concurrent CLI invocations
+//                     don't corrupt the index
+
+function atomicWriteFile(filePath: string, content: string): void {
+  const tmpPath = `${filePath}.tmp.${process.pid}`;
+  writeFileSync(tmpPath, content, "utf8");
+  renameSync(tmpPath, filePath);
+}
+
+function withLock<T>(fn: () => T): T {
+  ensureLockTarget();
+  // proper-lockfile's sync API doesn't support retries — a collision
+  // throws immediately. For a single-process MCP server + occasional
+  // CLI invocations that's fine; the rare contention case surfaces
+  // as a clear error instead of silently corrupting data. The stale
+  // timeout means a crashed process's lock gets auto-cleaned.
+  const release = lockfile.lockSync(LOCK_FILE, { stale: 10_000 });
+  try {
+    return fn();
+  } finally {
+    release();
   }
 }
 
@@ -140,16 +186,18 @@ function writeIndex(entries: Map<string, string>): void {
   const header =
     "# Memory Index\n\n_Auto-managed by agent-memory-mcp. Hand-edits to entries are preserved._\n\n";
   const sorted = Array.from(entries.values()).sort();
-  writeFileSync(INDEX_FILE, header + sorted.join("\n") + "\n", "utf8");
+  atomicWriteFile(INDEX_FILE, header + sorted.join("\n") + "\n");
 }
 
-function upsertIndexEntry(name: string, description: string): void {
+// Unlocked variants · safe to call only from inside a withLock block.
+
+function upsertIndexEntryUnlocked(name: string, description: string): void {
   const entries = readIndex();
   entries.set(name, `- [${name}](${name}.md) — ${description}`);
   writeIndex(entries);
 }
 
-function removeIndexEntry(name: string): void {
+function removeIndexEntryUnlocked(name: string): void {
   const entries = readIndex();
   entries.delete(name);
   writeIndex(entries);
@@ -180,13 +228,21 @@ function toolSaveMemory(args: Record<string, unknown>): string {
 
   ensureStorage();
 
-  const frontmatter = `---\nname: ${name}\ndescription: ${JSON.stringify(description)}\ntype: ${type}\n---\n\n`;
+  const frontmatter =
+    `---\n` +
+    `name: ${name}\n` +
+    `description: ${JSON.stringify(description)}\n` +
+    `type: ${type}\n` +
+    `schema: ${SCHEMA_VERSION}\n` +
+    `---\n\n`;
   const fp = memoryFilePath(name);
   const isUpdate = existsSync(fp);
-  writeFileSync(fp, frontmatter + content + "\n", "utf8");
-  upsertIndexEntry(name, description);
 
-  return `${isUpdate ? "Updated" : "Saved"} memory "${name}" (${type}) at ${fp}`;
+  return withLock(() => {
+    atomicWriteFile(fp, frontmatter + content + "\n");
+    upsertIndexEntryUnlocked(name, description);
+    return `${isUpdate ? "Updated" : "Saved"} memory "${name}" (${type}) at ${fp}`;
+  });
 }
 
 function toolGetMemory(args: Record<string, unknown>): string {
@@ -271,11 +327,155 @@ function toolSearchMemories(args: Record<string, unknown>): string {
 
 function toolDeleteMemory(args: Record<string, unknown>): string {
   const name = String(args.name ?? "").trim();
+  if (!SLUG_PATTERN.test(name)) throw new Error(`Invalid name "${name}".`);
   const fp = memoryFilePath(name);
   if (!existsSync(fp)) return `Memory "${name}" not found.`;
-  unlinkSync(fp);
-  removeIndexEntry(name);
-  return `Deleted memory "${name}".`;
+
+  return withLock(() => {
+    ensureTrash();
+    // Trash filename: <unix-ms>-<name>.md so restore can pick the
+    // most recent version and the operator can see when it was binned.
+    const ts = Date.now();
+    const trashPath = join(TRASH_DIR, `${ts}-${name}.md`);
+    renameSync(fp, trashPath);
+    removeIndexEntryUnlocked(name);
+    return `Moved "${name}" to trash. Restore with: agent-memory restore ${name}`;
+  });
+}
+
+function toolRestoreMemory(args: Record<string, unknown>): string {
+  const name = String(args.name ?? "").trim();
+  if (!SLUG_PATTERN.test(name)) throw new Error(`Invalid name "${name}".`);
+  ensureTrash();
+
+  // Most recent trash entry wins (timestamp prefix sorts lexically).
+  const matches = readdirSync(TRASH_DIR)
+    .filter((f) => f.endsWith(`-${name}.md`))
+    .sort()
+    .reverse();
+  if (matches.length === 0) return `No trashed memory named "${name}" found.`;
+
+  return withLock(() => {
+    const trashPath = join(TRASH_DIR, matches[0]);
+    const fp = memoryFilePath(name);
+    if (existsSync(fp)) {
+      throw new Error(
+        `Cannot restore: "${name}" already exists in the active store. ` +
+          `Delete it first (it'll get its own trash entry) then restore.`,
+      );
+    }
+    renameSync(trashPath, fp);
+    // Re-add to index using the restored file's frontmatter description.
+    const mem = readMemory(name);
+    if (mem) upsertIndexEntryUnlocked(name, mem.description);
+    return `Restored "${name}" from trash (was binned ${new Date(
+      Number(matches[0].split("-")[0]),
+    ).toISOString()}).`;
+  });
+}
+
+// -------------------------------------------------------------
+// Doctor · integrity check + repair
+// -------------------------------------------------------------
+
+interface DoctorReport {
+  storageDir: string;
+  diskFiles: string[];
+  indexEntries: string[];
+  orphans: string[]; // on disk, not in index
+  dangling: string[]; // in index, no file
+  unreadable: string[]; // parse errors
+  invalidType: string[]; // type not in VALID_TYPES
+  rebuilt: boolean;
+}
+
+function runDoctor(rebuildIndex: boolean): DoctorReport {
+  ensureStorage();
+  const diskFiles = listMemoryFiles();
+  const indexEntries = readIndex();
+  const indexNames = Array.from(indexEntries.keys());
+
+  const orphans = diskFiles.filter((n) => !indexEntries.has(n));
+  const dangling = indexNames.filter((n) => !diskFiles.includes(n));
+
+  const unreadable: string[] = [];
+  const invalidType: string[] = [];
+  for (const name of diskFiles) {
+    try {
+      const mem = readMemory(name);
+      if (!mem) {
+        unreadable.push(name);
+      } else if (!VALID_TYPES.has(mem.type)) {
+        invalidType.push(`${name} (type="${mem.type}")`);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      unreadable.push(`${name} (${msg.split("\n")[0]})`);
+    }
+  }
+
+  let rebuilt = false;
+  if (rebuildIndex && (orphans.length > 0 || dangling.length > 0)) {
+    withLock(() => {
+      const newEntries = new Map<string, string>();
+      for (const name of diskFiles) {
+        const mem = readMemory(name);
+        if (mem) {
+          newEntries.set(name, `- [${name}](${name}.md) — ${mem.description}`);
+        }
+      }
+      writeIndex(newEntries);
+    });
+    rebuilt = true;
+  }
+
+  return {
+    storageDir: MEMORY_DIR,
+    diskFiles,
+    indexEntries: indexNames,
+    orphans,
+    dangling,
+    unreadable,
+    invalidType,
+    rebuilt,
+  };
+}
+
+function formatDoctorReport(r: DoctorReport, rebuildRequested: boolean): string {
+  const lines: string[] = [];
+  lines.push(`agent-memory doctor`);
+  lines.push(`storage : ${r.storageDir}`);
+  lines.push(`on disk : ${r.diskFiles.length} memor${r.diskFiles.length === 1 ? "y" : "ies"}`);
+  lines.push(`indexed : ${r.indexEntries.length}`);
+  lines.push("");
+
+  const issueCount =
+    r.orphans.length + r.dangling.length + r.unreadable.length + r.invalidType.length;
+  if (issueCount === 0) {
+    lines.push("OK · no issues found");
+    return lines.join("\n");
+  }
+
+  lines.push(`Found ${issueCount} issue${issueCount === 1 ? "" : "s"}:`);
+  for (const o of r.orphans) lines.push(`  orphan   · ${o}.md exists on disk but not in MEMORY.md`);
+  for (const d of r.dangling) lines.push(`  dangling · ${d} indexed but file missing`);
+  for (const u of r.unreadable) lines.push(`  bad      · ${u}`);
+  for (const v of r.invalidType) lines.push(`  type     · ${v}`);
+
+  lines.push("");
+  if (r.rebuilt) {
+    lines.push(`Fixed · rebuilt MEMORY.md from disk (${r.diskFiles.length} entries).`);
+    lines.push(`Note · unreadable / invalid-type files were NOT removed. Inspect and fix by hand.`);
+  } else if (!rebuildRequested) {
+    lines.push("Re-run with --rebuild-index to reconstruct MEMORY.md from disk.");
+  }
+  return lines.join("\n");
+}
+
+function toolDoctor(args: Record<string, unknown>): string {
+  const rebuild = Boolean(args["rebuild-index"]);
+  const report = runDoctor(rebuild);
+  return formatDoctorReport(report, rebuild);
 }
 
 function extractSnippet(body: string, query: string): string | null {
@@ -445,13 +645,40 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "delete_memory",
-      description: "Remove a memory permanently (deletes the file and index entry).",
+      description:
+        "Move a memory to .trash/ (soft delete). The file is removed from the index but recoverable via restore_memory until you manually empty .trash/.",
       inputSchema: {
         type: "object",
         properties: {
           name: { type: "string", description: "The memory's name slug" },
         },
         required: ["name"],
+      },
+    },
+    {
+      name: "restore_memory",
+      description:
+        "Restore a memory from .trash/ back into the active store. Picks the most recent trash entry for the name.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "The memory's name slug" },
+        },
+        required: ["name"],
+      },
+    },
+    {
+      name: "doctor",
+      description:
+        "Check storage integrity. Reports orphan files (on disk but not indexed), dangling index entries (no file), unreadable files, and invalid types. Pass rebuild-index=true to reconstruct MEMORY.md from disk.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          "rebuild-index": {
+            type: "boolean",
+            description: "If true, rewrite MEMORY.md to match what's on disk.",
+          },
+        },
       },
     },
   ],
@@ -476,6 +703,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         break;
       case "delete_memory":
         result = toolDeleteMemory(args);
+        break;
+      case "restore_memory":
+        result = toolRestoreMemory(args);
+        break;
+      case "doctor":
+        result = toolDoctor(args);
         break;
       default:
         throw new Error(`Unknown tool: ${name}`);
@@ -505,6 +738,8 @@ const CLI_COMMANDS = new Set([
   "get",
   "list",
   "delete",
+  "restore",
+  "doctor",
   "import-claude-code",
   "help",
   "--help",
@@ -605,6 +840,18 @@ async function cliMain(command: string, rest: string[]): Promise<number> {
         process.stdout.write(toolDeleteMemory({ name }) + "\n");
         return 0;
       }
+      case "restore": {
+        const name = positional[0];
+        if (!name) throw new Error("Usage: agent-memory restore <name>");
+        process.stdout.write(toolRestoreMemory({ name }) + "\n");
+        return 0;
+      }
+      case "doctor": {
+        process.stdout.write(
+          toolDoctor({ "rebuild-index": Boolean(flags["rebuild-index"]) }) + "\n",
+        );
+        return 0;
+      }
       case "import-claude-code": {
         return importClaudeCode({
           source: flags.source ? String(flags.source) : undefined,
@@ -639,7 +886,11 @@ COMMANDS
   search <query>                           Substring search (top 10 by relevance)
   get <name>                               Print one memory's full contents
   list [--type <t>]                        List all memories (optionally by type)
-  delete <name>                            Remove a memory permanently
+  delete <name>                            Soft-delete: move to .trash/, removable later
+  restore <name>                           Restore the most recent trash entry for <name>
+  doctor [--rebuild-index]                 Check storage integrity (orphans, dangling
+                                           index entries, unreadable files). With
+                                           --rebuild-index, regenerates MEMORY.md from disk.
   import-claude-code [--source <path>] [--project <pat>] [--overwrite] [--dry-run]
                                            Walk ~/.claude/projects/*/memory/ and
                                            import each memory into the current store.

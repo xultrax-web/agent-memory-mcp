@@ -1,6 +1,6 @@
 {
   "name": "@xultrax-web/agent-memory-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "mcpName": "io.github.xultrax-web/agent-memory-mcp",
   "description": "Markdown memory for AI agents. Plain files you can read, edit, grep, and commit. The only MCP memory server that isn't a database.",
   "type": "module",
@@ -52,10 +52,12 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
-    "gray-matter": "^4.0.3"
+    "gray-matter": "^4.0.3",
+    "proper-lockfile": "^4.1.2"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
+    "@types/proper-lockfile": "^4.1.4",
     "prettier": "^3.8.3",
     "typescript": "^5.7.2"
   },
