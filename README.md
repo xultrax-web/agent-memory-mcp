@@ -116,10 +116,16 @@ Surfaces:
 
 The `healthy` flag is true iff no stale rules, no conflicts, no unreceipted ops in the recent log.
 
+### Compliance Receipt Protocol 1.0 spec (v0.11.5)
+
+The CRP enforcement primitive is documented as a standalone spec at [docs/compliance-receipt-protocol-1.0.md](docs/compliance-receipt-protocol-1.0.md). Other MCP servers can adopt the same receipt format + validation rules to interoperate · `agent-memory-mcp` is the reference implementation.
+
+The spec covers: receipt structure, canonical encoding, signing (HMAC-SHA256), validation order, rules-version hashing, reserved caveat types, MCP integration patterns, security considerations, cross-server adoption, and test vectors.
+
 ### Roadmap for the v0.11.x series:
 
-- Compliance Receipt Protocol 1.0 spec doc on GitHub so other MCP servers can adopt the pattern
-- Sampling-enriched Tier-2 `check_action` for clients that support it
+- Sampling-enriched Tier-2 `check_action` for clients that support it (Claude Desktop, VS Code Copilot)
+- Repositioning · README hero rewrite, /labs/agent-memory/ page, npm description (v0.11.6)
 
 ---
 
