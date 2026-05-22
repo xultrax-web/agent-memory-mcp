@@ -21,7 +21,8 @@
     "format:check": "prettier --check .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "prepare": "husky"
   },
   "keywords": [
     "mcp",
@@ -65,11 +66,18 @@
     "@types/node": "^22.10.2",
     "@types/proper-lockfile": "^4.1.4",
     "@types/react": "^19.2.15",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.0.5",
     "prettier": "^3.8.3",
     "typescript": "^5.7.2",
     "vitest": "^4.1.7"
   },
   "engines": {
     "node": ">=20"
+  },
+  "lint-staged": {
+    "*.{ts,tsx,js,mjs,cjs,json,jsonc,md,yml,yaml}": [
+      "prettier --write"
+    ]
   }
 }
