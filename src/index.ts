@@ -216,7 +216,8 @@ function withLock<T>(fn: () => T): T {
 // Types & validation
 // -------------------------------------------------------------
 
-const VALID_TYPES = new Set(["user", "feedback", "project", "reference"]);
+const VALID_TYPES = new Set(["user", "feedback", "project", "reference", "rule"]);
+const VALID_RULE_SEVERITIES = new Set(["hard", "soft"]);
 // Slug rules: lowercase a-z + digits + hyphen + underscore, start with
 // a letter or digit, 1-80 chars. Underscores are allowed because Claude
 // Code's memory tree uses them; we want frictionless import.
@@ -227,6 +228,13 @@ interface MemoryFrontmatter {
   description: string;
   type: string;
   tags?: string[];
+  // type=rule extensions · all optional, ignored on other types
+  severity?: "hard" | "soft";
+  scope?: string[]; // ["global"] | ["project:<name>", ...] | ["tool:<name>", ...]
+  applies_when?: string[]; // natural-language judgments for LLM enrichment
+  matches?: string[]; // regex patterns for deterministic match
+  enforce_on?: string[]; // action types this rule constrains
+  last_verified?: string; // YYYY-MM-DD
 }
 
 export interface Memory {
@@ -236,6 +244,13 @@ export interface Memory {
   tags: string[];
   body: string;
   filePath: string;
+  // type=rule fields surfaced (undefined for non-rule types)
+  severity?: "hard" | "soft";
+  scope?: string[];
+  applies_when?: string[];
+  matches?: string[];
+  enforce_on?: string[];
+  last_verified?: string;
 }
 
 // Tags: lowercase, digits, hyphen/underscore. Max 40 chars per tag.
@@ -250,12 +265,19 @@ export function memoryFilePath(name: string): string {
   return join(MEMORY_DIR, `${name}.md`);
 }
 
+function parseStringArray(input: unknown): string[] | undefined {
+  if (!Array.isArray(input)) return undefined;
+  const out = input.filter((x): x is string => typeof x === "string" && x.length > 0);
+  return out.length > 0 ? out : undefined;
+}
+
 export function readMemory(name: string): Memory | null {
   const fp = memoryFilePath(name);
   if (!existsSync(fp)) return null;
   const raw = readFileSync(fp, "utf8");
   const parsed = matter(raw);
   const fm = parsed.data as Partial<MemoryFrontmatter>;
+  const severity = fm.severity === "hard" || fm.severity === "soft" ? fm.severity : undefined;
   return {
     name: fm.name ?? name,
     description: fm.description ?? "",
@@ -263,6 +285,15 @@ export function readMemory(name: string): Memory | null {
     tags: Array.isArray(fm.tags) ? fm.tags.filter((t): t is string => typeof t === "string") : [],
     body: parsed.content.trim(),
     filePath: fp,
+    severity,
+    scope: parseStringArray(fm.scope),
+    applies_when: parseStringArray(fm.applies_when),
+    matches: parseStringArray(fm.matches),
+    enforce_on: parseStringArray(fm.enforce_on),
+    last_verified:
+      typeof fm.last_verified === "string" && /^\d{4}-\d{2}-\d{2}$/.test(fm.last_verified)
+        ? fm.last_verified
+        : undefined,
   };
 }
 
@@ -428,6 +459,7 @@ function toolSaveMemory(args: Record<string, unknown>): string {
       conflicts: conflictWarning ? "warned" : undefined,
     });
     log("debug", "save_memory", { name, type, update: isUpdate });
+    if (type === "rule") maybeAutoEmitCompanions();
     return `${isUpdate ? "Updated" : "Saved"} memory "${name}" (${type}) at ${fp}${conflictWarning}`;
   });
 }
@@ -1095,6 +1127,239 @@ function toolFindRelated(args: Record<string, unknown>): string {
 }
 
 // -------------------------------------------------------------
+// Rule memories · the v0.11 "memory as constraint" wedge
+// -------------------------------------------------------------
+//
+// Rules are first-class memories with type=rule. They differ from
+// other types in that they're meant to constrain agent behavior,
+// not just be retrievable facts. Three things differentiate them:
+//
+//   1. Frontmatter has severity / scope / applies_when / matches /
+//      enforce_on / last_verified · all optional, gracefully fall
+//      back when absent.
+//
+//   2. Companion-file emission · all type=rule memories project out
+//      to AGENTS.md (Linux-Foundation-stewarded universal standard
+//      read natively by Claude Code, Codex CLI, Cursor, Aider, Devin,
+//      Copilot, Gemini CLI, Windsurf, and Amazon Q as of late 2025).
+//      One source of truth, regenerated from the rule store.
+//
+//   3. `save_rule` is a convenience wrapper around save_memory that
+//      validates rule-specific fields, then auto-emits companions
+//      when AGENT_MEMORY_AUTO_EMIT_DIR is set in the environment
+//      (opt-in to avoid surprise file creation in arbitrary CWDs).
+
+function loadAllRules(): Memory[] {
+  return listMemoryFiles()
+    .map((n) => readMemory(n))
+    .filter((m): m is Memory => m !== null && m.type === "rule")
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function formatRuleAsMarkdown(rule: Memory): string {
+  const lines: string[] = [];
+  const sev = rule.severity ? ` _(${rule.severity})_` : "";
+  lines.push(`### ${rule.name}${sev}`);
+  lines.push("");
+  if (rule.description) lines.push(rule.description);
+  if (rule.scope && rule.scope.length > 0) {
+    lines.push(`- **Scope:** ${rule.scope.join(", ")}`);
+  }
+  if (rule.enforce_on && rule.enforce_on.length > 0) {
+    lines.push(`- **Enforce on:** ${rule.enforce_on.join(", ")}`);
+  }
+  if (rule.applies_when && rule.applies_when.length > 0) {
+    lines.push(`- **Applies when:**`);
+    for (const a of rule.applies_when) lines.push(`  - ${a}`);
+  }
+  if (rule.matches && rule.matches.length > 0) {
+    lines.push(
+      `- **Pattern matches:** \`${rule.matches.map((m) => m.replace(/`/g, "\\`")).join("` · `")}\``,
+    );
+  }
+  if (rule.last_verified) lines.push(`- _Last verified: ${rule.last_verified}_`);
+  if (rule.body) {
+    lines.push("");
+    lines.push(rule.body);
+  }
+  lines.push("");
+  return lines.join("\n");
+}
+
+function buildAgentsMdContent(rules: Memory[]): string {
+  const today = new Date().toISOString().slice(0, 10);
+  const head = [
+    `# Operator rules`,
+    ``,
+    `> Auto-generated by agent-memory-mcp from \`${MEMORY_DIR}\` on ${today}.`,
+    `> Edit the source memory files at that path — not this file — and rerun \`agent-memory emit-companions\` to refresh.`,
+    `>`,
+    `> ${rules.length} rule${rules.length === 1 ? "" : "s"} active.`,
+    ``,
+  ];
+
+  if (rules.length === 0) {
+    head.push(`No rules defined yet. Run \`agent-memory save-rule …\` to add the first one.`);
+    return head.join("\n") + "\n";
+  }
+
+  const hard = rules.filter((r) => r.severity === "hard");
+  const soft = rules.filter((r) => r.severity !== "hard");
+
+  const parts = [...head];
+  if (hard.length > 0) {
+    parts.push(`## Hard rules · always obey`);
+    parts.push(``);
+    for (const r of hard) parts.push(formatRuleAsMarkdown(r));
+  }
+  if (soft.length > 0) {
+    parts.push(`## Conventions · prefer to obey`);
+    parts.push(``);
+    for (const r of soft) parts.push(formatRuleAsMarkdown(r));
+  }
+  return parts.join("\n");
+}
+
+interface EmitCompanionsResult {
+  outDir: string;
+  emitted: string[];
+  rules_count: number;
+}
+
+function resolveCompanionDir(explicit?: string): string {
+  if (explicit && explicit.trim().length > 0) return explicit.trim();
+  const envOverride = process.env.AGENT_MEMORY_COMPANION_DIR;
+  if (envOverride && envOverride.trim().length > 0) return envOverride.trim();
+  return process.cwd();
+}
+
+function emitCompanions(opts: { outDir?: string } = {}): EmitCompanionsResult {
+  const outDir = resolveCompanionDir(opts.outDir);
+  const rules = loadAllRules();
+  const agentsPath = join(outDir, "AGENTS.md");
+  const content = buildAgentsMdContent(rules);
+
+  // Best-effort directory creation (companion dir may not exist if user
+  // passes a fresh path); mkdirSync is idempotent with recursive:true.
+  try {
+    mkdirSync(outDir, { recursive: true });
+  } catch {
+    // Ignore — atomicWriteFile will surface a clearer error if needed.
+  }
+  atomicWriteFile(agentsPath, content);
+
+  logEvent("emit_companions", { outDir, rules_count: rules.length, files: ["AGENTS.md"] });
+  return { outDir, emitted: [agentsPath], rules_count: rules.length };
+}
+
+function maybeAutoEmitCompanions(): void {
+  const autoDir = process.env.AGENT_MEMORY_AUTO_EMIT_DIR;
+  if (!autoDir || autoDir.trim().length === 0) return;
+  try {
+    emitCompanions({ outDir: autoDir });
+  } catch (err) {
+    log("warn", "auto_emit_failed", {
+      outDir: autoDir,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+function toolEmitCompanions(args: Record<string, unknown>): string {
+  const outDir = typeof args.out_dir === "string" ? args.out_dir : undefined;
+  const r = emitCompanions({ outDir });
+  if (r.rules_count === 0) {
+    return `Emitted ${r.emitted[0]} with no rules yet · run save_rule to add the first one.`;
+  }
+  return `Emitted ${r.rules_count} rule${r.rules_count === 1 ? "" : "s"} to ${r.emitted.join(", ")}.`;
+}
+
+function toolListRules(_args: Record<string, unknown>): string {
+  const rules = loadAllRules();
+  if (rules.length === 0) return "No rules defined yet. Use save_rule to add one.";
+  const lines: string[] = [];
+  lines.push(c(ANSI.bold, `${rules.length} rule${rules.length === 1 ? "" : "s"} active:`));
+  lines.push("");
+  for (const r of rules) {
+    const sev = r.severity ? ` [${r.severity}]` : "";
+    const scope = r.scope && r.scope.length > 0 ? ` · scope: ${r.scope.join(", ")}` : "";
+    const stale =
+      r.last_verified && Date.now() - new Date(r.last_verified).getTime() > 90 * 86400_000
+        ? c(ANSI.yellow, " · STALE >90d")
+        : "";
+    lines.push(`  ${r.name}${sev}${scope}${stale}`);
+    lines.push(`    ${r.description}`);
+  }
+  return lines.join("\n");
+}
+
+function toolSaveRule(args: Record<string, unknown>): string {
+  const name = String(args.name ?? "").trim();
+  const description = String(args.description ?? "").trim();
+  const content = String(args.content ?? "").trim();
+  const severity = String(args.severity ?? "soft").trim();
+  if (!VALID_RULE_SEVERITIES.has(severity)) {
+    throw new Error(
+      `Invalid severity "${severity}". Must be one of: ${Array.from(VALID_RULE_SEVERITIES).join(", ")}.`,
+    );
+  }
+  const scope = parseStringArray(args.scope);
+  const applies_when = parseStringArray(args.applies_when);
+  const matches = parseStringArray(args.matches);
+  const enforce_on = parseStringArray(args.enforce_on);
+  const last_verified =
+    typeof args.last_verified === "string" && /^\d{4}-\d{2}-\d{2}$/.test(args.last_verified)
+      ? args.last_verified
+      : new Date().toISOString().slice(0, 10);
+
+  if (!SLUG_PATTERN.test(name)) {
+    throw new Error(
+      `Invalid name "${name}". Use lowercase (a-z, 0-9, hyphen, underscore), 1-80 chars, must start with letter or digit.`,
+    );
+  }
+  if (!description) throw new Error("description is required");
+  if (!content) throw new Error("content is required");
+
+  ensureStorage();
+
+  const extras: string[] = [];
+  extras.push(`severity: ${severity}`);
+  if (scope) extras.push(`scope: [${scope.map((s) => JSON.stringify(s)).join(", ")}]`);
+  if (applies_when)
+    extras.push(`applies_when: [${applies_when.map((s) => JSON.stringify(s)).join(", ")}]`);
+  if (matches) extras.push(`matches: [${matches.map((s) => JSON.stringify(s)).join(", ")}]`);
+  if (enforce_on)
+    extras.push(`enforce_on: [${enforce_on.map((s) => JSON.stringify(s)).join(", ")}]`);
+  extras.push(`last_verified: ${last_verified}`);
+
+  const frontmatter =
+    `---\n` +
+    `name: ${name}\n` +
+    `description: ${JSON.stringify(description)}\n` +
+    `type: rule\n` +
+    extras.map((e) => `${e}\n`).join("") +
+    `schema: ${SCHEMA_VERSION}\n` +
+    `---\n\n`;
+
+  const fp = memoryFilePath(name);
+  const isUpdate = existsSync(fp);
+
+  return withLock(() => {
+    atomicWriteFile(fp, frontmatter + content + "\n");
+    upsertIndexEntryUnlocked(name, description);
+    logEvent("save_rule", {
+      name,
+      severity,
+      update: isUpdate,
+      bytes: content.length,
+    });
+    log("debug", "save_rule", { name, severity, update: isUpdate });
+    maybeAutoEmitCompanions();
+    return `${isUpdate ? "Updated" : "Saved"} rule "${name}" (${severity}) at ${fp}`;
+  });
+}
+
+// -------------------------------------------------------------
 // Git sync · multi-machine memory via git remote
 // -------------------------------------------------------------
 //
@@ -1469,7 +1734,7 @@ function actionColor(action: string): string {
 // -------------------------------------------------------------
 
 const server = new Server(
-  { name: "agent-memory", version: "0.10.3" },
+  { name: "agent-memory", version: "0.11.0" },
   { capabilities: { tools: {}, resources: {}, prompts: {} } },
 );
 
@@ -1755,9 +2020,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           type: {
             type: "string",
-            enum: ["user", "feedback", "project", "reference"],
+            enum: ["user", "feedback", "project", "reference", "rule"],
             description:
-              "Memory type: user (about the person), feedback (rules to follow), project (state/context), reference (external pointers)",
+              "Memory type: user (about the person), feedback (lessons + corrections), project (state/context), reference (external pointers), rule (constraint enforced via companion files — prefer the save_rule tool which validates rule-specific fields)",
           },
           content: {
             type: "string",
@@ -1964,6 +2229,91 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         "Pull memory updates from the configured git remote (fast-forward only). Run at the start of a session to get memories saved on other machines. Refuses to pull if there are uncommitted local changes.",
       inputSchema: { type: "object", properties: {} },
     },
+    {
+      name: "save_rule",
+      description:
+        "Save (or update) a rule memory · the 'memory as constraint' wedge. " +
+        "Rules constrain agent behavior, not just store facts. Severity 'hard' = " +
+        "must obey; 'soft' = prefer to obey. Rules auto-project out to AGENTS.md " +
+        "(read by Claude Code, Codex CLI, Cursor, Aider, Devin, Copilot, Gemini CLI, " +
+        "Windsurf, and Amazon Q natively) when AGENT_MEMORY_AUTO_EMIT_DIR is set, or " +
+        "via the emit_companions tool on demand.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: {
+            type: "string",
+            description:
+              "Short kebab-case slug, 1-80 chars (e.g. 'no-emojis-ever', 'tests-before-commit')",
+          },
+          description: {
+            type: "string",
+            description: "One-line summary of what the rule constrains",
+          },
+          content: {
+            type: "string",
+            description:
+              "Markdown body. Lead with the rule itself, then **Why:** and **How to apply:** lines.",
+          },
+          severity: {
+            type: "string",
+            enum: ["hard", "soft"],
+            description:
+              "hard = must obey (rule violations are blocked when enforced); soft = prefer to obey (warned but allowed). Defaults to soft.",
+          },
+          scope: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "Where this rule applies. Examples: ['global'], ['project:prefixcheck'], ['tool:git'].",
+          },
+          applies_when: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "Natural-language conditions for when the rule triggers. Used by Sampling-enriched check_action on supporting clients.",
+          },
+          matches: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "Regex patterns that deterministically signal a violation. Used by Tier-1 check_action on every client.",
+          },
+          enforce_on: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "Action categories this rule constrains. Examples: 'file_writes', 'commits', 'pushes', 'chat_responses'.",
+          },
+          last_verified: {
+            type: "string",
+            description: "ISO date (YYYY-MM-DD) of last verification. Defaults to today.",
+          },
+        },
+        required: ["name", "description", "content"],
+      },
+    },
+    {
+      name: "list_rules",
+      description:
+        "List every active rule memory with severity, scope, and staleness markers (>90 days since last_verified). Use this to audit which rules are currently constraining the agent.",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "emit_companions",
+      description:
+        "Regenerate companion rule files (AGENTS.md) from the current rule memories. Writes to the directory in `out_dir`, the AGENT_MEMORY_COMPANION_DIR env var, or the current working directory in that priority order. AGENTS.md is the universal cross-tool standard (Linux Foundation / Agentic AI Foundation).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          out_dir: {
+            type: "string",
+            description:
+              "Optional output directory. Defaults to AGENT_MEMORY_COMPANION_DIR env var, then process.cwd().",
+          },
+        },
+      },
+    },
   ],
 }));
 
@@ -2020,6 +2370,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "sync_pull":
         result = toolSyncPull(args);
         break;
+      case "save_rule":
+        result = toolSaveRule(args);
+        break;
+      case "list_rules":
+        result = toolListRules(args);
+        break;
+      case "emit_companions":
+        result = toolEmitCompanions(args);
+        break;
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
@@ -2057,6 +2416,9 @@ const CLI_COMMANDS = new Set([
   "backlinks",
   "related",
   "sync",
+  "save-rule",
+  "list-rules",
+  "emit-companions",
   "ui",
   "import-claude-code",
   "help",
@@ -2262,6 +2624,50 @@ async function cliMain(command: string, rest: string[]): Promise<number> {
             action: flags.action ? String(flags.action) : undefined,
           }) + "\n",
         );
+        return 0;
+      }
+      case "save-rule": {
+        const name = positional[0];
+        if (!name)
+          throw new Error(
+            "Usage: agent-memory save-rule <name> --description <d> [--severity hard|soft] " +
+              "[--scope a,b,c] [--applies-when a,b] [--matches a,b] [--enforce-on a,b] " +
+              "[--content <c> | --content-file <path> | --stdin]",
+          );
+        let content = String(flags.content ?? "");
+        if (flags["content-file"]) {
+          content = readFileSync(String(flags["content-file"]), "utf8");
+        } else if (flags.stdin) {
+          content = await readStdin();
+        }
+        const csv = (v: unknown): string[] | undefined => {
+          if (typeof v !== "string" || v.trim().length === 0) return undefined;
+          return v
+            .split(",")
+            .map((x) => x.trim())
+            .filter((x) => x.length > 0);
+        };
+        const result = toolSaveRule({
+          name,
+          description: String(flags.description ?? ""),
+          content,
+          severity: String(flags.severity ?? "soft"),
+          scope: csv(flags.scope),
+          applies_when: csv(flags["applies-when"]),
+          matches: csv(flags.matches),
+          enforce_on: csv(flags["enforce-on"]),
+          last_verified: flags["last-verified"] ? String(flags["last-verified"]) : undefined,
+        });
+        process.stdout.write(result + "\n");
+        return 0;
+      }
+      case "list-rules": {
+        process.stdout.write(toolListRules({}) + "\n");
+        return 0;
+      }
+      case "emit-companions": {
+        const out = flags.out ? String(flags.out) : undefined;
+        process.stdout.write(toolEmitCompanions({ out_dir: out }) + "\n");
         return 0;
       }
       case "ui": {

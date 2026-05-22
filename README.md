@@ -13,6 +13,34 @@ You can `cat` your memory. You can `grep` it. You can edit it in vim. You can co
 
 ---
 
+## New in v0.11 · rule memories + `AGENTS.md` emission
+
+A new memory type — `rule` — captures constraints the agent should respect, not just facts to recall. Rules carry optional frontmatter fields: `severity` (hard / soft), `scope`, `applies_when`, `matches`, `enforce_on`, and `last_verified`.
+
+When you save a rule (or run `agent-memory emit-companions`), the server projects every rule memory out to `AGENTS.md` — the cross-tool universal standard read natively by Claude Code, OpenAI Codex CLI, Cursor, Aider, Devin, GitHub Copilot, Gemini CLI, Windsurf, and Amazon Q. One source of truth in your memory store; every AI tool reads the same rules.
+
+```bash
+agent-memory save-rule no-emojis-ever \
+  --description "Never use emojis in commits, comments, or chat output." \
+  --severity hard \
+  --scope global \
+  --enforce-on commits,chat_responses \
+  --content "No emojis. Anywhere. Ever."
+
+agent-memory emit-companions  # writes ./AGENTS.md
+```
+
+Set `AGENT_MEMORY_AUTO_EMIT_DIR=/path/to/project` to auto-regenerate companions on every rule save.
+
+Roadmap for the v0.11.x series:
+
+- `CLAUDE.md` + `.cursor/rules/*.mdc` + `.gemini/instructions.md` emitters (per-tool native formats)
+- Compliance Receipts (Macaroon-style HMAC tokens · protocol-level enforcement of our own destructive tools)
+- `check_action` tool (deterministic rule matching · optional Sampling enrichment where clients support it)
+- `audit` command (rule conflicts · staleness · receipt-denial log)
+
+---
+
 ## What you get
 
 ```text

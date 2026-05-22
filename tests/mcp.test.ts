@@ -10,7 +10,7 @@ afterEach(() => {
 });
 
 describe("MCP · server protocol", () => {
-  test("tools/list returns all 16 tools", async () => {
+  test("tools/list returns all 19 tools", async () => {
     const responses = await runMcp(dir, [{ jsonrpc: "2.0", id: 1, method: "tools/list" }]);
     expect(responses).toHaveLength(1);
     const tools = (responses[0] as { result: { tools: { name: string }[] } }).result.tools;
@@ -18,14 +18,17 @@ describe("MCP · server protocol", () => {
     expect(names).toEqual([
       "delete_memory",
       "doctor",
+      "emit_companions",
       "find_backlinks",
       "find_related",
       "get_memory",
       "list_memories",
+      "list_rules",
       "log_events",
       "relevant_memories",
       "restore_memory",
       "save_memory",
+      "save_rule",
       "search_memories",
       "stats",
       "sync_pull",
