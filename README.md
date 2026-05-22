@@ -43,6 +43,35 @@ Companion file targets (v0.11.1):
 
 Set `AGENT_MEMORY_AUTO_EMIT_DIR=/path/to/project` to auto-regenerate all companions on every rule save.
 
+### `check_action` · the protocol enforcement point (v0.11.3)
+
+```bash
+# Agent proposes an action · server matches against rule store
+agent-memory check-action "delete the memory called old-project-notes" --type deletions
+
+# → On approval: returns a Compliance Receipt the agent passes back to destructive tools
+# → On deny: returns structured hard_violations + soft_warnings
+```
+
+MCP shape:
+
+```jsonc
+{
+  "name": "check_action",
+  "arguments": {
+    "action": "delete the memory called old-project-notes",
+    "action_type": "deletions",
+    "session_id": "sess_abc",
+  },
+}
+```
+
+Tier 1 (deterministic, every client): action is matched against `rule.matches` regexes, filtered by `rule.enforce_on` categories. Hard violations block; soft violations warn. Approved actions get a fresh receipt with 60s TTL.
+
+Tier 2 (Sampling-enriched LLM judgment on `rule.applies_when`) lands in v0.11.3.x for clients that support Sampling.
+
+**Receipt-gated delete_memory:** v0.11.3 accepts an optional `receipt` argument on `delete_memory`. Pass a receipt with `{type: 'action_type', value: 'deletions'}` and the delete validates against the rule store. v0.12 will make this required.
+
 ### Compliance Receipts (v0.11.2 · primitive · tool wiring in v0.11.3)
 
 Receipts are short-lived, HMAC-signed bearer tokens with caveats (Macaroon pattern · [Birgisson et al., NDSS 2014](https://research.google/pubs/pub41892/)). The novel protocol primitive in agent-memory-mcp: server-issued tokens that bind to action + session + rules-version-hash + expiry. Tampering breaks the HMAC. Rule changes invalidate stale receipts (because `rules_version` is part of the signed payload).

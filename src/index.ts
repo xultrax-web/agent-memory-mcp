@@ -728,6 +728,29 @@ export function toolDeleteMemory(args: Record<string, unknown>): string {
   const fp = memoryFilePath(name);
   if (!existsSync(fp)) return `Memory "${name}" not found.`;
 
+  // v0.11.3 · receipt-gated path. If a receipt is supplied, validate it
+  // against the current rule set + required caveats. If validation fails,
+  // refuse the delete with a clear reason. If no receipt is supplied,
+  // proceed (back-compat) but log so audit can surface the gap. v0.12
+  // will require receipts unconditionally for destructive ops.
+  const receipt = parseReceiptArg(args.receipt);
+  if (receipt) {
+    const v = validateReceipt(receipt, {
+      required_caveats: [{ type: "action_type", value: "deletions" }],
+    });
+    if (!v.valid) {
+      logEvent("delete_denied", { name, reason: v.reason, receipt_id: receipt.id });
+      throw new Error(
+        `delete_memory refused · receipt invalid (${v.reason}). ` +
+          `Call check_action({action: 'delete memory ${name}', action_type: 'deletions'}) ` +
+          `to get a fresh receipt.`,
+      );
+    }
+    logEvent("delete_approved_via_receipt", { name, receipt_id: receipt.id });
+  } else {
+    logEvent("delete_without_receipt", { name });
+  }
+
   return withLock(() => {
     ensureTrash();
     // Trash filename: <unix-ms>-<name>.md so restore can pick the
@@ -736,9 +759,12 @@ export function toolDeleteMemory(args: Record<string, unknown>): string {
     const trashPath = join(TRASH_DIR, `${ts}-${name}.md`);
     renameSync(fp, trashPath);
     removeIndexEntryUnlocked(name);
-    logEvent("delete", { name, trash: `${ts}-${name}.md` });
+    logEvent("delete", { name, trash: `${ts}-${name}.md`, gated: !!receipt });
     log("debug", "delete_memory", { name });
-    return `Moved "${name}" to trash. Restore with: agent-memory restore ${name}`;
+    const gateMsg = receipt
+      ? ` (gated by receipt ${receipt.id})`
+      : " (no receipt · v0.11.3 back-compat path)";
+    return `Moved "${name}" to trash${gateMsg}. Restore with: agent-memory restore ${name}`;
   });
 }
 
@@ -1719,6 +1745,176 @@ export function validateReceipt(
 }
 
 // -------------------------------------------------------------
+// check_action · v0.11.3 · the protocol enforcement point
+// -------------------------------------------------------------
+//
+// The "memory as constraint" wedge made operational. Agent proposes
+// an action, we check it against the rule store, and either:
+//
+//   - Approve → return a Compliance Receipt that destructive tools
+//     can require before executing (the receipt encodes WHAT was
+//     approved + WHEN it was approved + against WHICH rule set).
+//   - Deny → return a structured violation listing the rule(s) that
+//     blocked the action.
+//
+// Tier 1 (deterministic, every client): regex/category match against
+// rule.matches + rule.enforce_on.
+//
+// Tier 2 (Sampling-enriched, optional, v0.11.3.x): if the client
+// supports MCP Sampling, call back to the LLM for nuanced judgment
+// on rule.applies_when natural-language conditions. Deferred to a
+// follow-up release; Tier 1 is the load-bearing path.
+
+export interface RuleViolation {
+  /** The rule's slug (matches the memory filename). */
+  rule: string;
+  /** Severity at the time of the match. */
+  severity: "hard" | "soft";
+  /** Human-readable reason · usually `"matched pattern: '<regex>'"`. */
+  reason: string;
+}
+
+export interface CheckActionResult {
+  approved: boolean;
+  /** Receipt returned only when approved (no hard violations). */
+  receipt?: ComplianceReceipt;
+  /** Hard violations · these block approval. */
+  hard_violations: RuleViolation[];
+  /** Soft violations · approval still granted but warned. */
+  soft_warnings: RuleViolation[];
+  /** Number of rules evaluated (for visibility). */
+  rules_evaluated: number;
+}
+
+function safeRegex(pattern: string): RegExp | null {
+  try {
+    return new RegExp(pattern, "i");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Deterministic rule check. For each type=rule memory:
+ *   1. Skip if rule.enforce_on is non-empty and doesn't include actionType.
+ *   2. For each pattern in rule.matches, test against the proposed action.
+ *   3. If any pattern matches → violation entry.
+ * Hard violations block; soft violations warn.
+ */
+export function checkActionAgainstRules(
+  action: string,
+  actionType: string,
+): {
+  hard: RuleViolation[];
+  soft: RuleViolation[];
+  rules_evaluated: number;
+} {
+  const rules = loadAllRules();
+  const hard: RuleViolation[] = [];
+  const soft: RuleViolation[] = [];
+
+  for (const rule of rules) {
+    // Scope filter · if enforce_on is specified, the action's type must be
+    // listed. Empty enforce_on means "applies everywhere".
+    if (rule.enforce_on && rule.enforce_on.length > 0) {
+      if (!rule.enforce_on.includes(actionType)) continue;
+    }
+
+    // No matches array → this rule has no deterministic pattern, only
+    // applies_when (Sampling-only). Skip in Tier 1.
+    if (!rule.matches || rule.matches.length === 0) continue;
+
+    for (const pat of rule.matches) {
+      const re = safeRegex(pat);
+      if (!re) continue;
+      if (re.test(action)) {
+        const violation: RuleViolation = {
+          rule: rule.name,
+          severity: rule.severity ?? "soft",
+          reason: `matched pattern '${pat}' on action of type '${actionType}'`,
+        };
+        if (violation.severity === "hard") hard.push(violation);
+        else soft.push(violation);
+        break; // one match per rule is enough
+      }
+    }
+  }
+
+  return { hard, soft, rules_evaluated: rules.length };
+}
+
+function toolCheckAction(args: Record<string, unknown>): string {
+  const action = String(args.action ?? "").trim();
+  const actionType = String(args.action_type ?? "").trim();
+  const sessionId = typeof args.session_id === "string" ? args.session_id.trim() : "";
+
+  if (!action) throw new Error("action is required (the proposed action description)");
+  if (!actionType)
+    throw new Error(
+      "action_type is required (e.g. 'deletions', 'commits', 'file_writes', 'chat_responses')",
+    );
+
+  const { hard, soft, rules_evaluated } = checkActionAgainstRules(action, actionType);
+
+  if (hard.length > 0) {
+    const result: CheckActionResult = {
+      approved: false,
+      hard_violations: hard,
+      soft_warnings: soft,
+      rules_evaluated,
+    };
+    logEvent("check_action_denied", {
+      action,
+      action_type: actionType,
+      hard_count: hard.length,
+      soft_count: soft.length,
+    });
+    return JSON.stringify(result, null, 2);
+  }
+
+  // Approved · issue a receipt that downstream tools can require.
+  const caveats: Caveat[] = [
+    { type: "action_type", value: actionType },
+    { type: "action_hash", value: createHash("sha256").update(action).digest("hex").slice(0, 16) },
+  ];
+  if (sessionId) caveats.push({ type: "session", value: sessionId });
+
+  const receipt = issueReceipt({ caveats });
+  const result: CheckActionResult = {
+    approved: true,
+    receipt,
+    hard_violations: [],
+    soft_warnings: soft,
+    rules_evaluated,
+  };
+  logEvent("check_action_approved", {
+    action,
+    action_type: actionType,
+    receipt_id: receipt.id,
+    soft_count: soft.length,
+  });
+  return JSON.stringify(result, null, 2);
+}
+
+/**
+ * Parse a receipt argument · accepts either an already-decoded object or
+ * a JSON string (the form check_action returns when the agent calls it).
+ * Returns null if missing/unparseable.
+ */
+function parseReceiptArg(input: unknown): ComplianceReceipt | null {
+  if (!input) return null;
+  if (typeof input === "object") return input as ComplianceReceipt;
+  if (typeof input === "string") {
+    try {
+      return JSON.parse(input) as ComplianceReceipt;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+// -------------------------------------------------------------
 // Git sync · multi-machine memory via git remote
 // -------------------------------------------------------------
 //
@@ -2093,7 +2289,7 @@ function actionColor(action: string): string {
 // -------------------------------------------------------------
 
 const server = new Server(
-  { name: "agent-memory", version: "0.11.2" },
+  { name: "agent-memory", version: "0.11.3" },
   { capabilities: { tools: {}, resources: {}, prompts: {} } },
 );
 
@@ -2466,11 +2662,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "delete_memory",
       description:
-        "Move a memory to .trash/ (soft delete). The file is removed from the index but recoverable via restore_memory until you manually empty .trash/.",
+        "Move a memory to .trash/ (soft delete). The file is removed from the index but recoverable via restore_memory until you manually empty .trash/. " +
+        "v0.11.3+ accepts an optional `receipt` argument · pass a Compliance Receipt from check_action({action_type: 'deletions'}) to gate the delete against the rule store. " +
+        "Receipts must carry the caveat {type: 'action_type', value: 'deletions'} or the delete refuses. " +
+        "Receipts not supplied are accepted (back-compat) but logged · v0.12 will require them.",
       inputSchema: {
         type: "object",
         properties: {
           name: { type: "string", description: "The memory's name slug" },
+          receipt: {
+            description:
+              "Optional Compliance Receipt (object or JSON string) from check_action. v0.11.3 logs unreceipted deletes but doesn't block them yet.",
+          },
         },
         required: ["name"],
       },
@@ -2659,6 +2862,36 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: { type: "object", properties: {} },
     },
     {
+      name: "check_action",
+      description:
+        "v0.11.3 · the protocol enforcement point. Pass a proposed action description + its category; the server matches against rule memories (type=rule) and either:\n" +
+        "  - APPROVES: returns a short-lived Compliance Receipt (HMAC-signed, 60s default) the agent can pass to destructive tools (e.g. delete_memory) as proof of compliance.\n" +
+        "  - DENIES: returns structured hard_violations (severity:hard rules that block) and/or soft_warnings (severity:soft rules that warn but allow).\n\n" +
+        "Tier 1 (deterministic) matches the action against rule.matches regexes + rule.enforce_on category filter. Works on every MCP client.\n" +
+        "Tier 2 (Sampling-enriched LLM judgment on rule.applies_when) ships in v0.11.3.x for clients that support Sampling (Claude Desktop, VS Code Copilot).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            description:
+              "Description of the proposed action. Plain prose · 'delete the memory called X', 'push to main branch', 'commit with message Y', etc.",
+          },
+          action_type: {
+            type: "string",
+            description:
+              "Action category for rule.enforce_on matching. Examples: 'deletions', 'commits', 'pushes', 'file_writes', 'chat_responses', 'tool_calls'.",
+          },
+          session_id: {
+            type: "string",
+            description:
+              "Optional session identifier · binds the issued receipt to this session via a caveat.",
+          },
+        },
+        required: ["action", "action_type"],
+      },
+    },
+    {
       name: "emit_companions",
       description:
         "Regenerate companion rule files from the current rule memories. " +
@@ -2751,6 +2984,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "emit_companions":
         result = toolEmitCompanions(args);
         break;
+      case "check_action":
+        result = toolCheckAction(args);
+        break;
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
@@ -2791,6 +3027,7 @@ const CLI_COMMANDS = new Set([
   "save-rule",
   "list-rules",
   "emit-companions",
+  "check-action",
   "ui",
   "import-claude-code",
   "help",
@@ -3048,6 +3285,23 @@ async function cliMain(command: string, rest: string[]): Promise<number> {
             .filter((t) => t.length > 0);
         }
         process.stdout.write(toolEmitCompanions({ out_dir: out, targets }) + "\n");
+        return 0;
+      }
+      case "check-action": {
+        const action = positional[0];
+        const actionType = String(flags.type ?? flags["action-type"] ?? "");
+        if (!action || !actionType) {
+          throw new Error(
+            "Usage: agent-memory check-action '<action description>' --type <action_type> [--session <id>]",
+          );
+        }
+        process.stdout.write(
+          toolCheckAction({
+            action,
+            action_type: actionType,
+            session_id: flags.session ? String(flags.session) : undefined,
+          }) + "\n",
+        );
         return 0;
       }
       case "ui": {
