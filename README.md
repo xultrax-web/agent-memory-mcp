@@ -18,11 +18,11 @@ The wedge:
 
 ---
 
-## New in v0.11 · rule memories + `AGENTS.md` emission
+## Memory as constraint · the v0.11 → v0.13 arc
 
-A new memory type — `rule` — captures constraints the agent should respect, not just facts to recall. Rules carry optional frontmatter fields: `severity` (hard / soft), `scope`, `applies_when`, `matches`, `enforce_on`, and `last_verified`.
+What v0.10 and below shipped: a great file-based memory store. What v0.11+ added: rules that _enforce themselves_. A `rule` memory type carries `severity` (hard / soft), `scope`, `applies_when`, `matches` regex patterns, `enforce_on` categories, and `last_verified` date. From those, the server projects companion files out to every AI tool and gates destructive operations via cryptographic receipts.
 
-When you save a rule (or run `agent-memory emit-companions`), the server projects every rule memory out to `AGENTS.md` — the cross-tool universal standard read natively by Claude Code, OpenAI Codex CLI, Cursor, Aider, Devin, GitHub Copilot, Gemini CLI, Windsurf, and Amazon Q. One source of truth in your memory store; every AI tool reads the same rules.
+### 1. Rule memories project to every tool
 
 ```bash
 agent-memory save-rule no-emojis-ever \
@@ -34,10 +34,7 @@ agent-memory save-rule no-emojis-ever \
 
 agent-memory emit-companions
 # writes AGENTS.md + CLAUDE.md + .cursor/rules/*.mdc + .gemini/instructions.md
-# (v0.11.1 — all four targets · use --target agents,claude to filter)
 ```
-
-Companion file targets (v0.11.1):
 
 | Target   | Path                                                                                                   | Auto-loaded by                                                                        |
 | -------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------- |
@@ -46,9 +43,9 @@ Companion file targets (v0.11.1):
 | `cursor` | `.cursor/rules/operator-hard.mdc` (`alwaysApply: true`) + `operator-conventions.mdc` (agent-requested) | Cursor (MDC format)                                                                   |
 | `gemini` | `.gemini/instructions.md`                                                                              | Gemini CLI                                                                            |
 
-Set `AGENT_MEMORY_AUTO_EMIT_DIR=/path/to/project` to auto-regenerate all companions on every rule save.
+Set `AGENT_MEMORY_AUTO_EMIT_DIR=/path/to/project` and the server re-emits all four files automatically on every rule save.
 
-### `check_action` · the protocol enforcement point (v0.11.3)
+### 2. `check_action` · the protocol enforcement point
 
 ```bash
 # Agent proposes an action · server matches against rule store
@@ -71,20 +68,17 @@ MCP shape:
 }
 ```
 
-Tier 1 (deterministic, every client): action is matched against `rule.matches` regexes, filtered by `rule.enforce_on` categories. Hard violations block; soft violations warn. Approved actions get a fresh receipt with 60s TTL.
+**Tier 1** (deterministic, every client): action matched against `rule.matches` regex, filtered by `rule.enforce_on`. Hard violations block. Soft violations warn. Approved actions get a fresh receipt with 60s TTL.
 
-Tier 2 (Sampling-enriched LLM judgment on `rule.applies_when`) lands in v0.11.3.x for clients that support Sampling.
+**Tier 2** (Sampling-enriched, shipped v0.11.7): for rules with `applies_when` natural-language conditions, the server uses MCP Sampling to ask the client's LLM whether the proposed action triggers the rule. Falls back to Tier 1 only if the client doesn't advertise Sampling capability. Works on Claude Desktop and VS Code Copilot; on Claude Code, Cursor, Cline, and Codex CLI you get Tier 1 only — which is enough to enforce the rules you've written.
 
-**Receipt-gated delete_memory:** v0.11.3 accepts an optional `receipt` argument on `delete_memory`. Pass a receipt with `{type: 'action_type', value: 'deletions'}` and the delete validates against the rule store. v0.12 will make this required.
+### 3. Compliance Receipts · the cryptographic primitive
 
-### Compliance Receipts (v0.11.2 · primitive · tool wiring in v0.11.3)
-
-Receipts are short-lived, HMAC-signed bearer tokens with caveats (Macaroon pattern · [Birgisson et al., NDSS 2014](https://research.google/pubs/pub41892/)). The novel protocol primitive in agent-memory-mcp: server-issued tokens that bind to action + session + rules-version-hash + expiry. Tampering breaks the HMAC. Rule changes invalidate stale receipts (because `rules_version` is part of the signed payload).
+Receipts are short-lived, signed bearer tokens with caveats (Macaroon pattern · [Birgisson et al., NDSS 2014](https://research.google/pubs/pub41892/)). The novel protocol primitive: server-issued tokens that bind to action + session + rules-version-hash + expiry. Tampering breaks the signature. Rule changes invalidate every outstanding receipt (because `rules_version` is part of the signed payload).
 
 ```typescript
 import { issueReceipt, validateReceipt } from "@xultrax-web/agent-memory-mcp";
 
-// Server-internal: issue a receipt for a destructive action
 const r = issueReceipt({
   caveats: [
     { type: "action", value: "delete_memory" },
@@ -93,18 +87,17 @@ const r = issueReceipt({
   ttl_seconds: 60,
 });
 
-// Later: validate before executing the destructive op
 const v = validateReceipt(r, {
   required_caveats: [{ type: "action", value: "delete_memory" }],
 });
 if (!v.valid) throw new Error(v.reason);
 ```
 
-HMAC key lives at `<MEMORY_DIR>/.keyring/hmac-key` · 32 random bytes · mode `0600`. v0.11.3 wires receipts into `delete_memory` + other destructive tools and adds the `check_action` MCP tool.
+**Receipt-required `delete_memory` (v0.12.0 breaking change):** calling `delete_memory` without a valid receipt is refused. The two-step pattern is `check_action` → `delete_memory(name, receipt)`. The signing-key file lives at `<MEMORY_DIR>/.keyring/hmac-key` (CRP 1.0) or `<MEMORY_DIR>/.keyring/ed25519-priv` (CRP 1.1), `0600` perms on POSIX.
 
-### `audit` command (v0.11.4)
+**CRP 1.1 · Ed25519 federation (v0.13.0):** flip `CRP_SIGNING_MODE=ed25519` and the server signs with an asymmetric keypair instead of HMAC. The public key gets published at `<MEMORY_DIR>/.keyring/ed25519-pub`, so other MCP servers can validate your receipts without sharing a secret. The protocol allows cross-server enforcement: server A issues a receipt for "delete X", server B validates and honors it.
 
-Daily operational health report for the rule store:
+### 4. `audit` · operational health for the rule store
 
 ```bash
 agent-memory audit          # pretty colored terminal output
@@ -113,24 +106,17 @@ agent-memory audit --json   # structured JSON for tooling
 
 Surfaces:
 
-- Rule count broken down by severity (hard / soft / unspecified)
-- **Stale rules** · `last_verified` > 90 days ago, or never verified
-- **Pattern conflicts** · two rules sharing an `enforce_on` category AND an identical regex in their `matches` arrays
-- **Recent denials** · `check_action` calls that blocked an action (helps spot over-aggressive rules)
-- **Unreceipted destructive ops** · `delete_memory` calls that bypassed the receipt path (back-compat in v0.11.x · v0.12 will remove the path)
+- Rule count by severity (hard / soft / unspecified)
+- **Stale rules** · `last_verified` > 90 days, or never verified
+- **Pattern conflicts** · two rules sharing an `enforce_on` AND an identical regex in `matches`
+- **Recent denials** · `check_action` calls that blocked an action (spot over-aggressive rules)
+- **Unreceipted destructive ops** · should be empty in v0.12+; non-empty means a client is calling `delete_memory` without going through `check_action`
 
-The `healthy` flag is true iff no stale rules, no conflicts, no unreceipted ops in the recent log.
+The `healthy` flag is true iff no stale rules, no conflicts, no unreceipted ops.
 
-### Compliance Receipt Protocol 1.0 spec (v0.11.5)
+### 5. CRP 1.0 / 1.1 as a portable spec
 
-The CRP enforcement primitive is documented as a standalone spec at [docs/compliance-receipt-protocol-1.0.md](docs/compliance-receipt-protocol-1.0.md). Other MCP servers can adopt the same receipt format + validation rules to interoperate · `agent-memory-mcp` is the reference implementation.
-
-The spec covers: receipt structure, canonical encoding, signing (HMAC-SHA256), validation order, rules-version hashing, reserved caveat types, MCP integration patterns, security considerations, cross-server adoption, and test vectors.
-
-### Roadmap for the v0.11.x series:
-
-- Sampling-enriched Tier-2 `check_action` for clients that support it (Claude Desktop, VS Code Copilot)
-- Repositioning · README hero rewrite, /labs/agent-memory/ page, npm description (v0.11.6)
+The receipt protocol is documented standalone at [docs/compliance-receipt-protocol-1.0.md](docs/compliance-receipt-protocol-1.0.md). Other MCP servers can adopt the same format + validation rules to interoperate · `agent-memory-mcp` is the reference implementation. The spec covers: receipt structure, canonical encoding, signing (HMAC-SHA256 for 1.0, Ed25519 for 1.1), validation order, rules-version hashing, reserved caveat types, MCP integration patterns, security considerations, cross-server adoption, and test vectors.
 
 ---
 
@@ -311,7 +297,7 @@ Custom path:
 | `relevant_memories` | Same matching as search, but returns full memory bodies as one markdown doc. Built for LLM auto-context.                                                                    |
 | `get_memory`        | Fetch one memory by name. Returns frontmatter + body.                                                                                                                       |
 | `list_memories`     | List memories. Optional `type` filter. Paginated (default 50/page).                                                                                                         |
-| `delete_memory`     | Soft delete: moves the memory to `.trash/<ts>-<name>.md`. Recoverable until you empty `.trash/` by hand.                                                                    |
+| `delete_memory`     | **v0.12+: receipt-required.** Pass a valid Compliance Receipt with `{type:'action_type', value:'deletions'}`. Soft-deletes to `.trash/<ts>-<name>.md` on success.           |
 | `restore_memory`    | Restore a soft-deleted memory from `.trash/`. Picks the most recent trash entry for the name.                                                                               |
 | `doctor`            | Storage integrity check. Reports orphans, dangling index entries, unreadable files. Pass `rebuild-index=true` to repair `MEMORY.md` from disk.                              |
 | `stats`             | Dashboard: counts per type, total size, largest memory, audit-log size, trash count.                                                                                        |
@@ -322,6 +308,11 @@ Custom path:
 | `sync_status`       | Report git-sync state: remote URL, branch, uncommitted local files, ahead/behind origin.                                                                                    |
 | `sync_push`         | Commit local memory changes + push to the configured git remote. Auto-timestamps the commit message if none given.                                                          |
 | `sync_pull`         | Fast-forward pull from the git remote. Refuses to pull if local changes are uncommitted.                                                                                    |
+| `save_rule`         | **v0.11+.** Create or update a `rule` memory with `severity` / `scope` / `matches` / `enforce_on` / `applies_when` / `last_verified`. Auto-emits companions if configured.  |
+| `list_rules`        | **v0.11+.** List just rule memories, optionally filtered by severity or enforce_on category.                                                                                |
+| `emit_companions`   | **v0.11.1+.** Project the rule store out to `AGENTS.md` + `CLAUDE.md` + `.cursor/rules/*.mdc` + `.gemini/instructions.md`. Pass `target` to filter.                         |
+| `check_action`      | **v0.11.3+.** Tier-1 deterministic + Tier-2 Sampling rule check. Returns `{approved, hard_violations, soft_warnings, receipt?}`. The protocol enforcement point.            |
+| `audit`             | **v0.11.4+.** Operational health for the rule store: stale rules, pattern conflicts, recent denials, unreceipted destructive ops. Returns JSON or pretty-prints.            |
 
 ### Prompts
 
@@ -336,12 +327,13 @@ The server exposes 4 built-in MCP prompts that clients (Claude Desktop, Cursor, 
 
 ### Memory types
 
-Four built-in types, matching the Claude Code convention:
+Five built-in types. The first four match the Claude Code convention; `rule` is what v0.11 added:
 
 - **user** — facts about the person (role, preferences, expertise level)
-- **feedback** — rules the assistant should follow (do this, don't do that)
+- **feedback** — soft guidance for the assistant (prefer this style, lean toward that approach)
 - **project** — current-state context that isn't in the code (deadlines, in-flight work)
 - **reference** — pointers to external systems (Linear board URL, monitoring dashboard)
+- **rule** — constraints to enforce, not just facts to recall. Carries `severity`, `scope`, `matches`, `enforce_on`, `applies_when`, `last_verified`. Projects to companion files; gates `check_action`.
 
 ### Tags + wiki-links
 
@@ -392,6 +384,17 @@ agent-memory sync push                         # commit + push local changes
 agent-memory sync pull                         # fast-forward from remote
 agent-memory sync status                       # local + ahead/behind state
 agent-memory ui                                # launch the TUI (browse + edit interactively)
+
+# v0.11+ · rules and enforcement
+agent-memory save-rule no-emoji --severity hard --enforce-on commits,chat_responses \
+  --matches "emoji|:[a-z_]+:" --content "No emojis. Anywhere. Ever."
+agent-memory list-rules                        # rule memories only
+agent-memory list-rules --severity hard        # filter by severity
+agent-memory emit-companions                   # write AGENTS.md + CLAUDE.md + .cursor/rules + .gemini
+agent-memory emit-companions --target agents,claude   # filter targets
+agent-memory check-action "delete old notes" --type deletions   # returns approval + receipt JSON
+agent-memory audit                             # pretty operational health report
+agent-memory audit --json                      # structured JSON for tooling
 ```
 
 ### Multi-machine memory (git sync)
@@ -548,12 +551,28 @@ This server is built to be used daily, not to demo well once.
 - Detail pane previews the body of the selected memory
 - Color-coded by type, tag chips inline
 
-**Landing in v0.11+:**
+**Shipped in v0.11 · memory as constraint:**
 
-- Folder support (`.agent-memory/work/`, `.agent-memory/personal/`)
-- Memory packs for shareable curated bundles
-- Web UI for browser-based memory browsing (companion to the TUI)
-- Auto-context loading (LLM gets relevant memories transparently before each prompt)
+- `rule` memory type with `severity` / `scope` / `matches` / `enforce_on` / `applies_when` / `last_verified`
+- `save_rule` + `list_rules` tools and CLI commands
+- `emit_companions` projects rules to `AGENTS.md` + `CLAUDE.md` + `.cursor/rules/*.mdc` + `.gemini/instructions.md`
+- `AGENT_MEMORY_AUTO_EMIT_DIR` triggers re-emission on every rule save
+- **Compliance Receipts** (`issueReceipt` / `validateReceipt`) — HMAC-SHA256 bearer tokens with Macaroon-style caveats, bound to `rules_version` so rule changes invalidate outstanding tokens
+- `check_action` MCP tool (Tier 1 deterministic; Tier 2 Sampling-enriched on v0.11.7 for clients that advertise the capability)
+- `audit` command — stale rules, pattern conflicts, recent denials, unreceipted destructive ops
+- [CRP 1.0 protocol spec](docs/compliance-receipt-protocol-1.0.md) — portable, vendor-neutral
+
+**Shipped in v0.12 · the wedge made teeth (breaking change):**
+
+- `delete_memory` REQUIRES a valid receipt. Calling without one is refused at the tool boundary.
+- Two-step pattern is canonical: `check_action` → receipt → `delete_memory(name, receipt)`
+- Audit log no longer needs an "unreceipted ops" warning class to surface escapes — there are none
+
+**Shipped in v0.13 · cross-server federation:**
+
+- CRP 1.1 · Ed25519 asymmetric signing (set `CRP_SIGNING_MODE=ed25519`)
+- Public key published at `<MEMORY_DIR>/.keyring/ed25519-pub` so other servers can validate without sharing a secret
+- 9 dedicated Ed25519 tests verifying keypair generation, signing, and cross-server validation paths
 
 ---
 
@@ -572,16 +591,28 @@ This server is built to be used daily, not to demo well once.
 | v0.7      | MCP Prompts (4 starter workflows), `verify_memory`, conflict detection on save                      |
 | v0.8      | Tags, `[[wiki-links]]`, `find_backlinks`, `find_related`                                            |
 | v0.8.1    | Trusted Publishing live · tokenless OIDC publishes to npm + MCP Registry on git tag                 |
-| **v0.9**  | **`agent-memory sync` · multi-machine memory via git remote (init/push/pull/status/log)**           |
-| **v0.10** | **Ink-based TUI · `agent-memory ui` for visual browsing, search, and editing**                      |
+| v0.9      | `agent-memory sync` · multi-machine memory via git remote (init/push/pull/status/log)               |
+| v0.10     | Ink-based TUI · `agent-memory ui` for visual browsing, search, and editing                          |
+| v0.11.0   | `rule` memory type + `AGENTS.md` companion emitter                                                  |
+| v0.11.1   | `CLAUDE.md` + `.cursor/rules/*.mdc` + `.gemini/instructions.md` emitters                            |
+| v0.11.2   | Compliance Receipts primitive · HMAC-SHA256 tokens with Macaroon-style caveats                      |
+| v0.11.3   | `check_action` MCP tool (Tier 1 deterministic) + receipt-gated `delete_memory` (opt-in)             |
+| v0.11.4   | `audit` command · stale rules, pattern conflicts, recent denials, unreceipted ops                   |
+| v0.11.5   | CRP 1.0 protocol spec — portable, vendor-neutral enforcement primitive                              |
+| v0.11.6   | Repositioning · "codify how you work, every AI tool obeys"                                          |
+| v0.11.7   | Tier-2 Sampling-enriched `check_action` · LLM judges `applies_when` on capable clients              |
+| **v0.12** | **Receipt REQUIRED on `delete_memory` · breaking change · the wedge made teeth**                    |
+| **v0.13** | **CRP 1.1 · Ed25519 asymmetric signing for cross-server federation**                                |
 
 ### Coming next
 
-- Folder support inside the store (`.agent-memory/work/`, `.agent-memory/personal/`) for multi-context separation
-- Auto-context loading — server hook that auto-fires `relevant_memories` before each LLM turn so context flows transparently
+- Receipt-gated `restore_memory` and `doctor --rebuild-index` (same `check_action` flow)
+- Federation example · a second reference MCP server that issues + validates CRP 1.1 receipts
+- Auto-context loading — server hook that auto-fires `relevant_memories` before each LLM turn
+- Folder support inside the store (`.agent-memory/work/`, `.agent-memory/personal/`)
 - Memory packs — export/import shareable `.tar.gz` bundles of curated memories
-- Browser companion UI (`agent-memory web`) for non-terminal users
-- TUI polish — file-watching for auto-refresh, inline editing, sync push/pull as keybindings
+- Browser companion UI (`agent-memory web`)
+- TUI polish — file-watching for auto-refresh, inline editing, sync as keybindings
 
 ### Beyond
 
