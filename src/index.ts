@@ -26,6 +26,8 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
+  GetPromptRequestSchema,
+  ListPromptsRequestSchema,
   ListResourcesRequestSchema,
   ListToolsRequestSchema,
   ReadResourceRequestSchema,
@@ -331,13 +333,104 @@ function toolSaveMemory(args: Record<string, unknown>): string {
   const fp = memoryFilePath(name);
   const isUpdate = existsSync(fp);
 
+  // Conflict detection · only when creating a NEW memory (updates are
+  // intentional re-saves and don't need a similarity warning). Fuzzy
+  // match against existing names + descriptions; if anything scores
+  // above the conflict threshold, warn but don't block — the LLM can
+  // decide whether to merge, rename, or proceed.
+  let conflictWarning = "";
+  if (!isUpdate) {
+    const conflicts = detectConflicts({ name, description, type });
+    if (conflicts.length > 0) {
+      const list = conflicts
+        .map((c) => `  - ${c.name} [${c.type}] (${c.similarity}% similar)`)
+        .join("\n");
+      conflictWarning =
+        `\n\nWARNING · potentially similar existing memory(ies):\n${list}\n` +
+        `Consider merging or renaming. To proceed anyway, the save has already been completed.`;
+    }
+  }
+
   return withLock(() => {
     atomicWriteFile(fp, frontmatter + content + "\n");
     upsertIndexEntryUnlocked(name, description);
-    logEvent("save", { name, type, update: isUpdate, bytes: content.length });
+    logEvent("save", {
+      name,
+      type,
+      update: isUpdate,
+      bytes: content.length,
+      conflicts: conflictWarning ? "warned" : undefined,
+    });
     log("debug", "save_memory", { name, type, update: isUpdate });
-    return `${isUpdate ? "Updated" : "Saved"} memory "${name}" (${type}) at ${fp}`;
+    return `${isUpdate ? "Updated" : "Saved"} memory "${name}" (${type}) at ${fp}${conflictWarning}`;
   });
+}
+
+interface ConflictMatch {
+  name: string;
+  type: string;
+  similarity: number;
+}
+
+function detectConflicts(candidate: {
+  name: string;
+  description: string;
+  type: string;
+}): ConflictMatch[] {
+  const names = listMemoryFiles();
+  // Skip the candidate name itself (will be an update, not a conflict)
+  const others = names.filter((n) => n !== candidate.name);
+  if (others.length === 0) return [];
+
+  const existing = others.map((n) => readMemory(n)).filter((m): m is Memory => m !== null);
+  if (existing.length === 0) return [];
+
+  // Two separate searches catch different conflict shapes:
+  //   - Name-based: matches when the new slug is very close to an
+  //     existing slug (e.g. "deploy-process" vs "deployment-strategy")
+  //   - Description-based: matches when descriptions are paraphrases
+  //     of each other regardless of name
+  // We merge results + dedupe. Threshold 0.5 here is intentionally
+  // looser than search (0.4) because we'd rather warn on a few false
+  // positives than miss an obvious duplicate.
+  // Threshold 0.6 catches paraphrases like "deployment-strategy" vs
+  // "deploy-process" (Fuse Bitap scores those around 0.5). The 45%
+  // similarity floor below then trims out the long tail.
+  const nameFuse = new Fuse(existing, {
+    includeScore: true,
+    threshold: 0.6,
+    ignoreLocation: true,
+    minMatchCharLength: 3,
+    keys: ["name"],
+  });
+  const descFuse = new Fuse(existing, {
+    includeScore: true,
+    threshold: 0.6,
+    ignoreLocation: true,
+    minMatchCharLength: 3,
+    keys: ["description"],
+  });
+
+  const merged = new Map<string, ConflictMatch>();
+  const addHit = (name: string, type: string, score: number) => {
+    const existingHit = merged.get(name);
+    const similarity = Math.round((1 - score) * 100);
+    if (!existingHit || similarity > existingHit.similarity) {
+      merged.set(name, { name, type, similarity });
+    }
+  };
+
+  for (const r of nameFuse.search(candidate.name, { limit: 3 })) {
+    addHit(r.item.name, r.item.type, r.score ?? 1);
+  }
+  for (const r of descFuse.search(candidate.description, { limit: 3 })) {
+    addHit(r.item.name, r.item.type, r.score ?? 1);
+  }
+
+  return Array.from(merged.values())
+    .filter((h) => h.similarity >= 45) // 45%+ similarity = worth surfacing
+    .sort((a, b) => b.similarity - a.similarity)
+    .slice(0, 3);
 }
 
 function toolGetMemory(args: Record<string, unknown>): string {
@@ -671,6 +764,102 @@ function toolDoctor(args: Record<string, unknown>): string {
 }
 
 // -------------------------------------------------------------
+// verify_memory · re-evaluate a memory's claims
+// -------------------------------------------------------------
+//
+// Static analysis only (no network calls — MCP servers may run
+// offline). Extracts URLs + dates + file paths from the body and
+// returns a structured report the LLM can act on. Pairs with the
+// audit_stale prompt to triage memory hygiene.
+
+const URL_PATTERN = /\bhttps?:\/\/[^\s<>"')]+/g;
+const DATE_PATTERN = /\b(20\d{2})-(\d{2})-(\d{2})\b/g;
+const FILE_PATH_PATTERN = /\b(?:[A-Za-z]:\\|\/)?(?:[\w.-]+[\\/])+[\w.-]+\.\w+\b/g;
+
+function toolVerifyMemory(args: Record<string, unknown>): string {
+  const name = String(args.name ?? "").trim();
+  if (!SLUG_PATTERN.test(name)) throw new Error(`Invalid name "${name}".`);
+  const mem = readMemory(name);
+  if (!mem) return `Memory "${name}" not found.`;
+
+  const urls = Array.from(new Set(mem.body.match(URL_PATTERN) ?? []));
+  const dates = Array.from(new Set((mem.body.match(DATE_PATTERN) ?? []).map((d) => d)));
+  const filePaths = Array.from(new Set(mem.body.match(FILE_PATH_PATTERN) ?? []));
+
+  // Staleness heuristic: if any date in the body is more than 60 days
+  // old AND the memory type is project, flag it for review.
+  const now = Date.now();
+  const SIXTY_DAYS = 60 * 24 * 3600 * 1000;
+  const oldDates = dates.filter((d) => {
+    const parsed = Date.parse(d);
+    return !isNaN(parsed) && now - parsed > SIXTY_DAYS;
+  });
+
+  const lines: string[] = [];
+  lines.push(c(ANSI.bold, `verify_memory · ${mem.name}`));
+  lines.push(`type        : ${mem.type}`);
+  lines.push(`description : ${mem.description}`);
+  lines.push("");
+  lines.push(c(ANSI.bold, "Static signals:"));
+  lines.push(`  URLs found        : ${urls.length}`);
+  lines.push(
+    `  Dates referenced  : ${dates.length}${oldDates.length > 0 ? ` (${oldDates.length} > 60 days old)` : ""}`,
+  );
+  lines.push(`  File-path refs    : ${filePaths.length}`);
+
+  if (urls.length > 0) {
+    lines.push("");
+    lines.push(c(ANSI.bold, "URLs to verify:"));
+    for (const u of urls.slice(0, 10)) lines.push(`  - ${u}`);
+    if (urls.length > 10) lines.push(`  ... +${urls.length - 10} more`);
+  }
+
+  if (oldDates.length > 0) {
+    lines.push("");
+    lines.push(c(ANSI.yellow, "Stale-date signals (consider whether claims are still current):"));
+    for (const d of oldDates.slice(0, 5)) lines.push(`  - ${d}`);
+  }
+
+  if (filePaths.length > 0 && filePaths.length <= 10) {
+    lines.push("");
+    lines.push(c(ANSI.bold, "File paths referenced:"));
+    for (const fp of filePaths) lines.push(`  - ${fp}`);
+  }
+
+  lines.push("");
+  lines.push(c(ANSI.bold, "Type-specific verification heuristics:"));
+  switch (mem.type) {
+    case "reference":
+      lines.push("  - HEAD-check each URL above (200 = alive, 404 = dead, 410 = gone)");
+      lines.push("  - Verify the resource still says what the memory claims it says");
+      break;
+    case "project":
+      lines.push("  - Check if any dates above are stale relative to current project state");
+      lines.push("  - Cross-reference any names/people mentioned against current org chart");
+      lines.push("  - Verify any deadlines or commitments haven't already passed");
+      break;
+    case "feedback":
+      lines.push("  - Confirm the rule still applies (operator hasn't changed their mind)");
+      lines.push(
+        "  - Check the **Why:** is still load-bearing — if the original reason is gone, the rule may be obsolete",
+      );
+      break;
+    case "user":
+      lines.push(
+        "  - User preferences drift over time; ask the operator if a 6+ month old memory still holds",
+      );
+      break;
+  }
+
+  lines.push("");
+  lines.push(c(ANSI.dim, "Memory body for review:"));
+  lines.push("");
+  lines.push(mem.body);
+
+  return lines.join("\n");
+}
+
+// -------------------------------------------------------------
 // Stats · operator dashboard
 // -------------------------------------------------------------
 
@@ -796,8 +985,8 @@ function actionColor(action: string): string {
 // -------------------------------------------------------------
 
 const server = new Server(
-  { name: "agent-memory", version: "0.2.0" },
-  { capabilities: { tools: {}, resources: {} } },
+  { name: "agent-memory", version: "0.7.0" },
+  { capabilities: { tools: {}, resources: {}, prompts: {} } },
 );
 
 // -------------------------------------------------------------
@@ -868,6 +1057,197 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   throw new Error(
     `Unknown resource URI: ${uri}. Supported: ${URI_INDEX}, ${URI_MEMORY_PREFIX}{name}`,
   );
+});
+
+// -------------------------------------------------------------
+// Prompts · slash-command workflows the client surfaces
+// -------------------------------------------------------------
+//
+// MCP Prompts are NOT tools — they're structured prompt templates
+// the client offers to the user. When invoked, we return a message
+// array that the client passes back to the LLM. This is how memory
+// becomes ACTIVE: workflows like "extract memories from this
+// conversation" or "summarize what we know about X" stop being
+// something the operator has to remember to phrase manually.
+
+interface PromptDefinition {
+  name: string;
+  description: string;
+  arguments?: { name: string; description: string; required: boolean }[];
+}
+
+const PROMPTS: PromptDefinition[] = [
+  {
+    name: "extract_memories",
+    description:
+      "Scan the current conversation for things worth remembering. Returns a structured prompt asking the LLM to identify candidate memories and call save_memory for each one.",
+  },
+  {
+    name: "summarize_topic",
+    description:
+      "Pull memories relevant to a topic and ask the LLM to synthesize them into a single coherent summary.",
+    arguments: [
+      { name: "topic", description: "What to summarize what's known about.", required: true },
+    ],
+  },
+  {
+    name: "prepare_handoff",
+    description:
+      "Generate a project state snapshot from all project-type memories matching a filter. Useful for rotating on-call, end-of-day handoffs, or onboarding a collaborator.",
+    arguments: [
+      {
+        name: "project",
+        description: "Substring to filter project memories by (matches name + description + tags).",
+        required: false,
+      },
+    ],
+  },
+  {
+    name: "audit_stale",
+    description:
+      "Walk recent project and reference memories and ask the LLM to flag which ones are likely stale or contradicted by current state. Pairs with verify_memory for follow-up.",
+  },
+];
+
+server.setRequestHandler(ListPromptsRequestSchema, async () => ({
+  prompts: PROMPTS,
+}));
+
+server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+  const { name, arguments: args = {} } = request.params;
+  ensureStorage();
+
+  switch (name) {
+    case "extract_memories":
+      return {
+        description: PROMPTS[0].description,
+        messages: [
+          {
+            role: "user",
+            content: {
+              type: "text",
+              text: [
+                "Scan the current conversation for facts, rules, preferences, decisions, or context that would be useful to remember across future sessions. Focus on things that:",
+                "",
+                "- Reflect the operator's stable preferences or working style (type=user)",
+                "- Represent rules the assistant should follow going forward (type=feedback)",
+                "- Capture current-state context not derivable from code or docs (type=project)",
+                "- Point at external resources the operator references (type=reference)",
+                "",
+                "For each candidate, call the save_memory tool with:",
+                "  - name: a short kebab-case slug (a-z, 0-9, -, _)",
+                "  - type: one of user | feedback | project | reference",
+                "  - description: a one-line summary used in the index",
+                "  - content: the memory body in markdown. For feedback/project, include `**Why:**` and `**How to apply:**` lines.",
+                "",
+                "Before saving each one, briefly explain why it's worth remembering. Skip anything that's already obvious from code or that's only relevant to the current session.",
+                "",
+                "If there's nothing worth saving, say so plainly and stop.",
+              ].join("\n"),
+            },
+          },
+        ],
+      };
+
+    case "summarize_topic": {
+      const topic = String(args.topic ?? "").trim();
+      if (!topic) throw new Error("summarize_topic requires a 'topic' argument");
+      return {
+        description: PROMPTS[1].description,
+        messages: [
+          {
+            role: "user",
+            content: {
+              type: "text",
+              text: [
+                `Call the relevant_memories tool with query="${topic}" (max=10).`,
+                "",
+                "Then synthesize the returned memories into a single coherent summary covering:",
+                "",
+                "1. What's established / known",
+                "2. Open questions or unresolved tensions across the memories",
+                "3. Any stale or contradicted claims worth flagging",
+                "",
+                "Keep it tight — aim for one paragraph per section unless the material is genuinely dense. Cite the source memory names inline as `[memory-name]`.",
+              ].join("\n"),
+            },
+          },
+        ],
+      };
+    }
+
+    case "prepare_handoff": {
+      const project = String(args.project ?? "").trim();
+      const filterClause = project
+        ? `filtered to project memories matching "${project}"`
+        : "across all project memories";
+      return {
+        description: PROMPTS[2].description,
+        messages: [
+          {
+            role: "user",
+            content: {
+              type: "text",
+              text: [
+                `Generate a project handoff document ${filterClause}.`,
+                "",
+                project
+                  ? `Start by calling list_memories with type="project", then filter the results by substring match against "${project}".`
+                  : `Start by calling list_memories with type="project" to get the full set.`,
+                "",
+                "For each relevant memory, call get_memory to load its full body. Then produce a single handoff document with these sections:",
+                "",
+                "## Current state",
+                "What's in flight or recently shipped, distilled from project memories.",
+                "",
+                "## Open items",
+                "Anything explicitly noted as pending, waiting, or unresolved.",
+                "",
+                "## Watch-outs",
+                "Constraints, deadlines, or hidden gotchas captured in memory.",
+                "",
+                "## Reference material",
+                "Links and external resources the next person should know about (from reference memories if they're relevant to the project).",
+                "",
+                "Cite source memories inline as `[memory-name]`. Keep prose dense; this is meant to be read by an experienced operator, not explained from scratch.",
+              ].join("\n"),
+            },
+          },
+        ],
+      };
+    }
+
+    case "audit_stale":
+      return {
+        description: PROMPTS[3].description,
+        messages: [
+          {
+            role: "user",
+            content: {
+              type: "text",
+              text: [
+                'Call list_memories with type="project", then list_memories with type="reference". For each memory returned, evaluate whether its claims are likely still true based on:',
+                "",
+                "- Dates in the body (anything more than 30 days old in a `project` memory deserves scrutiny)",
+                "- References to people, dependencies, or systems that may have changed",
+                "- Claims about external state (URLs, dashboards, APIs) that you can't verify without external access",
+                "",
+                "Produce a triage list with three buckets:",
+                "",
+                "**Likely stale** (high confidence they're outdated) — explain why, suggest action.",
+                "**Worth verifying** (claims you can't evaluate without external access) — suggest using the verify_memory tool.",
+                "**Still fresh** (nothing in the content suggests staleness).",
+                "",
+                "Be conservative on the 'likely stale' bucket — false positives there create work for the operator.",
+              ].join("\n"),
+            },
+          },
+        ],
+      };
+
+    default:
+      throw new Error(`Unknown prompt: ${name}`);
+  }
 });
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -1022,6 +1402,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+    {
+      name: "verify_memory",
+      description:
+        "Re-evaluate a memory's claims against signals in its content. Extracts URLs, dates, and file paths from the body; flags stale-date signals on project-type memories; returns type-specific verification heuristics for the LLM or operator to act on. Pairs with the audit_stale prompt.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "The memory's name slug" },
+        },
+        required: ["name"],
+      },
+    },
   ],
 }));
 
@@ -1060,6 +1452,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "log_events":
         result = toolLogEvents(args);
         break;
+      case "verify_memory":
+        result = toolVerifyMemory(args);
+        break;
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
@@ -1093,6 +1488,7 @@ const CLI_COMMANDS = new Set([
   "doctor",
   "stats",
   "log",
+  "verify",
   "import-claude-code",
   "help",
   "--help",
@@ -1231,6 +1627,12 @@ async function cliMain(command: string, rest: string[]): Promise<number> {
         process.stdout.write(toolStats({}) + "\n");
         return 0;
       }
+      case "verify": {
+        const name = positional[0];
+        if (!name) throw new Error("Usage: agent-memory verify <name>");
+        process.stdout.write(toolVerifyMemory({ name }) + "\n");
+        return 0;
+      }
       case "log": {
         process.stdout.write(
           toolLogEvents({
@@ -1284,6 +1686,9 @@ COMMANDS
   stats                                    Dashboard: counts per type, sizes, audit/trash counts.
   log [--tail N] [--action save|delete|restore]
                                            Recent audit-log entries.
+  verify <name>                            Re-evaluate a memory's claims (URLs, dates, file refs,
+                                           type-specific staleness heuristics). Static analysis;
+                                           no network calls.
   import-claude-code [--source <path>] [--project <pat>] [--overwrite] [--dry-run]
                                            Walk ~/.claude/projects/*/memory/ and
                                            import each memory into the current store.

@@ -258,6 +258,76 @@ describe("CLI · pagination + stats + events", () => {
   });
 });
 
+describe("CLI · verify + conflict detection", () => {
+  test("verify extracts URLs and stale-date signals", () => {
+    runCli(dir, [
+      "save",
+      "with-url",
+      "--type",
+      "reference",
+      "--description",
+      "Test memory with URL and old date",
+      "--content",
+      "See https://example.com/runbook. Updated 2024-01-15.",
+    ]);
+    const r = runCli(dir, ["verify", "with-url"]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("URLs found        : 1");
+    expect(r.stdout).toContain("https://example.com/runbook");
+    expect(r.stdout).toContain("2024-01-15");
+  });
+
+  test("save warns on near-duplicate description", () => {
+    runCli(dir, [
+      "save",
+      "deploy-process",
+      "--type",
+      "project",
+      "--description",
+      "Production deployment uses blue-green strategy",
+      "--content",
+      "Body 1.",
+    ]);
+    const r = runCli(dir, [
+      "save",
+      "deployment-strategy",
+      "--type",
+      "project",
+      "--description",
+      "Production deployment with blue-green approach",
+      "--content",
+      "Body 2.",
+    ]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("WARNING");
+    expect(r.stdout).toContain("deploy-process");
+  });
+
+  test("save does NOT warn on unrelated memory", () => {
+    runCli(dir, [
+      "save",
+      "deploy-process",
+      "--type",
+      "project",
+      "--description",
+      "Production deployment uses blue-green strategy",
+      "--content",
+      "Body 1.",
+    ]);
+    const r = runCli(dir, [
+      "save",
+      "user-likes-tabs",
+      "--type",
+      "user",
+      "--description",
+      "Operator prefers tabs over spaces",
+      "--content",
+      "Body 2.",
+    ]);
+    expect(r.stdout).not.toContain("WARNING");
+  });
+});
+
 describe("CLI · meta", () => {
   test("help prints usage", () => {
     const r = runCli(dir, ["help"]);

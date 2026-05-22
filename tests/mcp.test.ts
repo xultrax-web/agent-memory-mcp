@@ -10,7 +10,7 @@ afterEach(() => {
 });
 
 describe("MCP · server protocol", () => {
-  test("tools/list returns 10 tools", async () => {
+  test("tools/list returns all 11 tools", async () => {
     const responses = await runMcp(dir, [{ jsonrpc: "2.0", id: 1, method: "tools/list" }]);
     expect(responses).toHaveLength(1);
     const tools = (responses[0] as { result: { tools: { name: string }[] } }).result.tools;
@@ -26,7 +26,39 @@ describe("MCP · server protocol", () => {
       "save_memory",
       "search_memories",
       "stats",
+      "verify_memory",
     ]);
+  });
+
+  test("prompts/list returns 4 starter prompts", async () => {
+    const responses = await runMcp(dir, [{ jsonrpc: "2.0", id: 1, method: "prompts/list" }]);
+    expect(responses).toHaveLength(1);
+    const prompts = (responses[0] as { result: { prompts: { name: string }[] } }).result.prompts;
+    const names = prompts.map((p) => p.name).sort();
+    expect(names).toEqual([
+      "audit_stale",
+      "extract_memories",
+      "prepare_handoff",
+      "summarize_topic",
+    ]);
+  });
+
+  test("prompts/get returns a structured message", async () => {
+    const responses = await runMcp(dir, [
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "prompts/get",
+        params: { name: "summarize_topic", arguments: { topic: "deployment" } },
+      },
+    ]);
+    expect(responses).toHaveLength(1);
+    const result = (
+      responses[0] as { result: { messages: { role: string; content: { text: string } }[] } }
+    ).result;
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0].role).toBe("user");
+    expect(result.messages[0].content.text).toContain("deployment");
   });
 
   test("save → resources/list → resources/read round-trip", async () => {

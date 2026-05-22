@@ -185,18 +185,30 @@ Custom path:
 
 ## Tools
 
-| Tool                | Purpose                                                                                                                                        |
-| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `save_memory`       | Create or update a memory. Atomic write + locked. Validates name + type. Updates the index.                                                    |
-| `search_memories`   | Fuzzy search (Fuse.js · typo-tolerant, word-order tolerant, partial matches). Returns top N with relevance 0-100 + body snippet.               |
-| `relevant_memories` | Same matching as search, but returns full memory bodies as one markdown doc. Built for LLM auto-context.                                       |
-| `get_memory`        | Fetch one memory by name. Returns frontmatter + body.                                                                                          |
-| `list_memories`     | List memories. Optional `type` filter. Paginated (default 50/page).                                                                            |
-| `delete_memory`     | Soft delete: moves the memory to `.trash/<ts>-<name>.md`. Recoverable until you empty `.trash/` by hand.                                       |
-| `restore_memory`    | Restore a soft-deleted memory from `.trash/`. Picks the most recent trash entry for the name.                                                  |
-| `doctor`            | Storage integrity check. Reports orphans, dangling index entries, unreadable files. Pass `rebuild-index=true` to repair `MEMORY.md` from disk. |
-| `stats`             | Dashboard: counts per type, total size, largest memory, audit-log size, trash count.                                                           |
-| `log_events`        | Read recent entries from the audit event log. Optional `tail` (default 20) + `action` filter.                                                  |
+| Tool                | Purpose                                                                                                                                                                     |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `save_memory`       | Create or update a memory. Atomic write + locked. Validates name + type. Updates the index.                                                                                 |
+| `search_memories`   | Fuzzy search (Fuse.js · typo-tolerant, word-order tolerant, partial matches). Returns top N with relevance 0-100 + body snippet.                                            |
+| `relevant_memories` | Same matching as search, but returns full memory bodies as one markdown doc. Built for LLM auto-context.                                                                    |
+| `get_memory`        | Fetch one memory by name. Returns frontmatter + body.                                                                                                                       |
+| `list_memories`     | List memories. Optional `type` filter. Paginated (default 50/page).                                                                                                         |
+| `delete_memory`     | Soft delete: moves the memory to `.trash/<ts>-<name>.md`. Recoverable until you empty `.trash/` by hand.                                                                    |
+| `restore_memory`    | Restore a soft-deleted memory from `.trash/`. Picks the most recent trash entry for the name.                                                                               |
+| `doctor`            | Storage integrity check. Reports orphans, dangling index entries, unreadable files. Pass `rebuild-index=true` to repair `MEMORY.md` from disk.                              |
+| `stats`             | Dashboard: counts per type, total size, largest memory, audit-log size, trash count.                                                                                        |
+| `log_events`        | Read recent entries from the audit event log. Optional `tail` (default 20) + `action` filter.                                                                               |
+| `verify_memory`     | Re-evaluate a memory's claims. Extracts URLs/dates/file refs, flags stale-date signals, returns type-specific verification heuristics. Pairs with the `audit_stale` prompt. |
+
+### Prompts
+
+The server exposes 4 built-in MCP prompts that clients (Claude Desktop, Cursor, etc.) surface as slash-commands. These turn memory into an active workflow layer, not just a passive store:
+
+| Prompt             | Arguments            | What it does                                                                                                                            |
+| ------------------ | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `extract_memories` | none                 | LLM scans the current conversation, proposes candidate memories, and calls `save_memory` for each one (with type + description chosen). |
+| `summarize_topic`  | `topic`              | LLM pulls memories relevant to the topic via `relevant_memories` and synthesizes them into a single summary with citations.             |
+| `prepare_handoff`  | `project` (optional) | LLM walks project-type memories matching the filter and assembles a structured handoff doc (current state, open items, watch-outs).     |
+| `audit_stale`      | none                 | LLM evaluates project + reference memories for staleness and produces a triage list (likely stale / worth verifying / still fresh).     |
 
 ### Memory types
 
@@ -229,6 +241,7 @@ agent-memory doctor --rebuild-index            # repair MEMORY.md from disk
 agent-memory stats                             # dashboard: counts, sizes, audit/trash
 agent-memory log                               # last 20 entries from the audit log
 agent-memory log --tail 50 --action delete     # filter by action, tail size
+agent-memory verify deploy-process             # extract URLs/dates/file refs + staleness heuristics
 ```
 
 ### Audit log + structured logging
@@ -326,15 +339,22 @@ This server is built to be used daily, not to demo well once.
 
 **Shipped in v0.6:**
 
-- **Vitest test suite** — 20+ blackbox tests covering CLI + MCP server paths.
-- **GitHub Actions CI** — runs tests on every push/PR across Node 18/20/22.
+- **Vitest test suite** — 25+ blackbox tests covering CLI + MCP server paths.
+- **GitHub Actions CI** — runs tests on every push/PR across Node 20/22/24.
 - **[COMPATIBILITY.md](COMPATIBILITY.md)** — known-working client matrix + quirks.
 
-**Landing in v0.7:**
+**Shipped in v0.7 · the active context layer:**
 
-- Read-only mode (`AGENT_MEMORY_READ_ONLY=1`)
-- Live multi-client verification (Cursor, Cline, Claude Desktop, Continue)
-- Demo GIF / screencast
+- **MCP Prompts capability** — 4 built-in workflows (`extract_memories`, `summarize_topic`, `prepare_handoff`, `audit_stale`) that the client surfaces as slash-commands.
+- **`verify_memory` tool** — static analysis of a memory's URLs/dates/file refs with type-specific staleness heuristics. Plus the matching `agent-memory verify <name>` CLI.
+- **Conflict detection on save** — fuzzy-matches new memories against existing ones; warns on near-duplicates without blocking the save (so the LLM can decide whether to merge, rename, or proceed).
+
+**Landing in v0.8 - v0.9:**
+
+- Tags + wiki-links + folder support + `find_related` (organization-at-scale)
+- TUI / web UI for browsing + editing memories in a clean interface
+- `agent-memory sync` for git-backed multi-machine memory (the moat)
+- Memory packs for shareable curated bundles
 
 ---
 
