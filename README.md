@@ -27,14 +27,24 @@ agent-memory save-rule no-emojis-ever \
   --enforce-on commits,chat_responses \
   --content "No emojis. Anywhere. Ever."
 
-agent-memory emit-companions  # writes ./AGENTS.md
+agent-memory emit-companions
+# writes AGENTS.md + CLAUDE.md + .cursor/rules/*.mdc + .gemini/instructions.md
+# (v0.11.1 — all four targets · use --target agents,claude to filter)
 ```
 
-Set `AGENT_MEMORY_AUTO_EMIT_DIR=/path/to/project` to auto-regenerate companions on every rule save.
+Companion file targets (v0.11.1):
+
+| Target   | Path                                                                                                   | Auto-loaded by                                                                        |
+| -------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------- |
+| `agents` | `AGENTS.md`                                                                                            | Claude Code, Codex CLI, Cursor, Aider, Devin, Copilot, Gemini CLI, Windsurf, Amazon Q |
+| `claude` | `CLAUDE.md`                                                                                            | Claude Code (5-level hierarchy · managed/global/project/local/subdir)                 |
+| `cursor` | `.cursor/rules/operator-hard.mdc` (`alwaysApply: true`) + `operator-conventions.mdc` (agent-requested) | Cursor (MDC format)                                                                   |
+| `gemini` | `.gemini/instructions.md`                                                                              | Gemini CLI                                                                            |
+
+Set `AGENT_MEMORY_AUTO_EMIT_DIR=/path/to/project` to auto-regenerate all companions on every rule save.
 
 Roadmap for the v0.11.x series:
 
-- `CLAUDE.md` + `.cursor/rules/*.mdc` + `.gemini/instructions.md` emitters (per-tool native formats)
 - Compliance Receipts (Macaroon-style HMAC tokens · protocol-level enforcement of our own destructive tools)
 - `check_action` tool (deterministic rule matching · optional Sampling enrichment where clients support it)
 - `audit` command (rule conflicts · staleness · receipt-denial log)

@@ -1,6 +1,6 @@
 {
   "name": "@xultrax-web/agent-memory-mcp",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "mcpName": "io.github.xultrax-web/agent-memory-mcp",
   "description": "Markdown memory for AI agents. Plain files you can read, edit, grep, and commit. Operator-grade storage with atomic writes, file locking, tags, [[wiki-links]], find_related, git-backed multi-machine sync, and an Ink-based TUI.",
   "type": "module",

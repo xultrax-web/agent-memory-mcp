@@ -1220,10 +1220,16 @@ function buildAgentsMdContent(rules: Memory[]): string {
   return parts.join("\n");
 }
 
+// Companion target keys · keep this stable, downstream consumers (audit,
+// CI scripts, etc.) check the emitted-files list against these names.
+export type CompanionTarget = "agents" | "claude" | "cursor" | "gemini";
+export const ALL_COMPANION_TARGETS: CompanionTarget[] = ["agents", "claude", "cursor", "gemini"];
+
 interface EmitCompanionsResult {
   outDir: string;
   emitted: string[];
   rules_count: number;
+  targets: CompanionTarget[];
 }
 
 function resolveCompanionDir(explicit?: string): string {
@@ -1233,23 +1239,159 @@ function resolveCompanionDir(explicit?: string): string {
   return process.cwd();
 }
 
-function emitCompanions(opts: { outDir?: string } = {}): EmitCompanionsResult {
-  const outDir = resolveCompanionDir(opts.outDir);
-  const rules = loadAllRules();
-  const agentsPath = join(outDir, "AGENTS.md");
-  const content = buildAgentsMdContent(rules);
+// CLAUDE.md content · same body as AGENTS.md but with a Claude-Code-specific
+// header. Claude Code's 5-level hierarchy (managed/global/project/local/subdir)
+// reads any CLAUDE.md it finds; we generate the project-root file by default.
+function buildClaudeMdContent(rules: Memory[]): string {
+  const body = buildAgentsMdContent(rules);
+  // Replace the AGENTS.md-specific header sentence with a CLAUDE.md one
+  return body.replace(
+    /^# Operator rules\n/,
+    `# Operator rules · Claude Code\n\n> This is your CLAUDE.md — Claude Code reads it on session start.\n\n`,
+  );
+}
 
-  // Best-effort directory creation (companion dir may not exist if user
-  // passes a fresh path); mkdirSync is idempotent with recursive:true.
+// .gemini/instructions.md content · same body as AGENTS.md, slightly different
+// header.
+function buildGeminiInstructionsContent(rules: Memory[]): string {
+  const body = buildAgentsMdContent(rules);
+  return body.replace(
+    /^# Operator rules\n/,
+    `# Operator rules · Gemini CLI\n\n> Loaded by Gemini CLI from .gemini/instructions.md on session start.\n\n`,
+  );
+}
+
+interface CursorMdcFile {
+  filename: string;
+  content: string;
+}
+
+// Cursor consumes .cursor/rules/*.mdc files with their own YAML frontmatter.
+// Per spec: each file <150 lines, alwaysApply file <50 lines, dir total <500.
+// Strategy: one file per severity (hard / soft) — hard is alwaysApply, soft
+// is description-driven so the agent pulls it in when relevant.
+function buildCursorMdcFiles(rules: Memory[]): CursorMdcFile[] {
+  const hard = rules.filter((r) => r.severity === "hard");
+  const soft = rules.filter((r) => r.severity !== "hard");
+  const files: CursorMdcFile[] = [];
+
+  if (hard.length > 0) {
+    const fm = [
+      "---",
+      `description: "Operator hard rules · always obey · auto-generated from agent-memory-mcp"`,
+      "alwaysApply: true",
+      "---",
+      "",
+      "# Operator hard rules",
+      "",
+      "These rules MUST be obeyed. Violations should be flagged and blocked.",
+      "",
+    ].join("\n");
+    files.push({
+      filename: "operator-hard.mdc",
+      content: fm + hard.map((r) => formatRuleAsMarkdown(r)).join("\n"),
+    });
+  }
+
+  if (soft.length > 0) {
+    const fm = [
+      "---",
+      `description: "Operator conventions · prefer to obey · pulled in by agent on relevance"`,
+      "alwaysApply: false",
+      "---",
+      "",
+      "# Operator conventions",
+      "",
+      "Soft rules · prefer to obey. The agent may consult these when the context warrants.",
+      "",
+    ].join("\n");
+    files.push({
+      filename: "operator-conventions.mdc",
+      content: fm + soft.map((r) => formatRuleAsMarkdown(r)).join("\n"),
+    });
+  }
+
+  return files;
+}
+
+interface EmitOptions {
+  outDir?: string;
+  targets?: CompanionTarget[];
+}
+
+function emitCompanions(opts: EmitOptions = {}): EmitCompanionsResult {
+  const outDir = resolveCompanionDir(opts.outDir);
+  const targets = opts.targets && opts.targets.length > 0 ? opts.targets : ALL_COMPANION_TARGETS;
+  const rules = loadAllRules();
+
+  // Best-effort directory creation; mkdirSync recursive is idempotent.
   try {
     mkdirSync(outDir, { recursive: true });
   } catch {
-    // Ignore — atomicWriteFile will surface a clearer error if needed.
+    // Ignore — atomicWriteFile surfaces a clearer error if needed.
   }
-  atomicWriteFile(agentsPath, content);
 
-  logEvent("emit_companions", { outDir, rules_count: rules.length, files: ["AGENTS.md"] });
-  return { outDir, emitted: [agentsPath], rules_count: rules.length };
+  const emitted: string[] = [];
+
+  if (targets.includes("agents")) {
+    const fp = join(outDir, "AGENTS.md");
+    atomicWriteFile(fp, buildAgentsMdContent(rules));
+    emitted.push(fp);
+  }
+  if (targets.includes("claude")) {
+    const fp = join(outDir, "CLAUDE.md");
+    atomicWriteFile(fp, buildClaudeMdContent(rules));
+    emitted.push(fp);
+  }
+  if (targets.includes("cursor")) {
+    const cursorDir = join(outDir, ".cursor", "rules");
+    try {
+      mkdirSync(cursorDir, { recursive: true });
+    } catch {
+      // Ignore — atomicWriteFile surfaces clearer error if needed.
+    }
+    const files = buildCursorMdcFiles(rules);
+    if (files.length === 0) {
+      // No rules yet — drop a placeholder so the tool knows where to put them
+      const placeholderPath = join(cursorDir, "operator-rules.mdc");
+      const placeholder = [
+        "---",
+        `description: "Operator rules · auto-generated · no rules defined yet"`,
+        "alwaysApply: false",
+        "---",
+        "",
+        "No rules defined yet. Run `agent-memory save-rule` to add the first one.",
+        "",
+      ].join("\n");
+      atomicWriteFile(placeholderPath, placeholder);
+      emitted.push(placeholderPath);
+    } else {
+      for (const f of files) {
+        const fp = join(cursorDir, f.filename);
+        atomicWriteFile(fp, f.content);
+        emitted.push(fp);
+      }
+    }
+  }
+  if (targets.includes("gemini")) {
+    const geminiDir = join(outDir, ".gemini");
+    try {
+      mkdirSync(geminiDir, { recursive: true });
+    } catch {
+      // Ignore — atomicWriteFile surfaces clearer error if needed.
+    }
+    const fp = join(geminiDir, "instructions.md");
+    atomicWriteFile(fp, buildGeminiInstructionsContent(rules));
+    emitted.push(fp);
+  }
+
+  logEvent("emit_companions", {
+    outDir,
+    rules_count: rules.length,
+    targets,
+    files: emitted.map((p) => p.replace(outDir, "").replace(/^[\\/]/, "")),
+  });
+  return { outDir, emitted, rules_count: rules.length, targets };
 }
 
 function maybeAutoEmitCompanions(): void {
@@ -1267,11 +1409,19 @@ function maybeAutoEmitCompanions(): void {
 
 function toolEmitCompanions(args: Record<string, unknown>): string {
   const outDir = typeof args.out_dir === "string" ? args.out_dir : undefined;
-  const r = emitCompanions({ outDir });
-  if (r.rules_count === 0) {
-    return `Emitted ${r.emitted[0]} with no rules yet · run save_rule to add the first one.`;
+  let targets: CompanionTarget[] | undefined;
+  if (Array.isArray(args.targets)) {
+    targets = (args.targets as unknown[])
+      .filter((t): t is string => typeof t === "string")
+      .filter((t): t is CompanionTarget => (ALL_COMPANION_TARGETS as string[]).includes(t));
+    if (targets.length === 0) targets = undefined;
   }
-  return `Emitted ${r.rules_count} rule${r.rules_count === 1 ? "" : "s"} to ${r.emitted.join(", ")}.`;
+  const r = emitCompanions({ outDir, targets });
+  const files = r.emitted.map((p) => p.replace(r.outDir, "").replace(/^[\\/]/, "")).join(", ");
+  if (r.rules_count === 0) {
+    return `Emitted ${r.emitted.length} placeholder file(s) to ${r.outDir} (${files}) · no rules yet · run save_rule to add the first one.`;
+  }
+  return `Emitted ${r.rules_count} rule${r.rules_count === 1 ? "" : "s"} across ${r.targets.length} target${r.targets.length === 1 ? "" : "s"} (${r.targets.join(", ")}) → ${r.emitted.length} file${r.emitted.length === 1 ? "" : "s"} at ${r.outDir}: ${files}`;
 }
 
 function toolListRules(_args: Record<string, unknown>): string {
@@ -1734,7 +1884,7 @@ function actionColor(action: string): string {
 // -------------------------------------------------------------
 
 const server = new Server(
-  { name: "agent-memory", version: "0.11.0" },
+  { name: "agent-memory", version: "0.11.1" },
   { capabilities: { tools: {}, resources: {}, prompts: {} } },
 );
 
@@ -2302,14 +2452,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "emit_companions",
       description:
-        "Regenerate companion rule files (AGENTS.md) from the current rule memories. Writes to the directory in `out_dir`, the AGENT_MEMORY_COMPANION_DIR env var, or the current working directory in that priority order. AGENTS.md is the universal cross-tool standard (Linux Foundation / Agentic AI Foundation).",
+        "Regenerate companion rule files from the current rule memories. " +
+        "Writes one or more of: AGENTS.md (universal cross-tool standard, Linux Foundation), " +
+        "CLAUDE.md (Claude Code's 5-level hierarchy), .cursor/rules/*.mdc (Cursor's MDC format · hard rules get alwaysApply:true, soft rules become description-driven), " +
+        ".gemini/instructions.md (Gemini CLI). " +
+        "Default writes ALL four targets. Use `targets` to filter. Output dir resolves from `out_dir`, then AGENT_MEMORY_COMPANION_DIR env, then process.cwd().",
       inputSchema: {
         type: "object",
         properties: {
           out_dir: {
             type: "string",
             description:
-              "Optional output directory. Defaults to AGENT_MEMORY_COMPANION_DIR env var, then process.cwd().",
+              "Optional output directory. Defaults to AGENT_MEMORY_COMPANION_DIR env, then process.cwd().",
+          },
+          targets: {
+            type: "array",
+            items: {
+              type: "string",
+              enum: ["agents", "claude", "cursor", "gemini"],
+            },
+            description:
+              "Which companion files to emit. Omit (or pass empty) to emit all four. Examples: ['agents'] for AGENTS.md only, ['claude','cursor'] for Claude Code + Cursor.",
           },
         },
       },
@@ -2667,7 +2830,15 @@ async function cliMain(command: string, rest: string[]): Promise<number> {
       }
       case "emit-companions": {
         const out = flags.out ? String(flags.out) : undefined;
-        process.stdout.write(toolEmitCompanions({ out_dir: out }) + "\n");
+        const target = flags.target;
+        let targets: string[] | undefined;
+        if (typeof target === "string" && target.length > 0) {
+          targets = target
+            .split(",")
+            .map((t) => t.trim())
+            .filter((t) => t.length > 0);
+        }
+        process.stdout.write(toolEmitCompanions({ out_dir: out, targets }) + "\n");
         return 0;
       }
       case "ui": {

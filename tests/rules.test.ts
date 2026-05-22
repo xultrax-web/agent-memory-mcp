@@ -159,6 +159,136 @@ describe("companion files · emit-companions", () => {
     }
   });
 
+  test("emit-companions writes all 4 targets by default (AGENTS.md, CLAUDE.md, .cursor/rules/*.mdc, .gemini/instructions.md)", () => {
+    runCli(dir, [
+      "save-rule",
+      "no-emojis",
+      "--description",
+      "No emojis in output.",
+      "--severity",
+      "hard",
+      "--content",
+      "Never use emojis.",
+    ]);
+    runCli(dir, [
+      "save-rule",
+      "prefer-typed",
+      "--description",
+      "Prefer typed APIs.",
+      "--severity",
+      "soft",
+      "--content",
+      "Use the typed API.",
+    ]);
+    const out = makeTempDir();
+    try {
+      const r = runCli(dir, ["emit-companions", "--out", out]);
+      expect(r.exitCode).toBe(0);
+      // AGENTS.md
+      expect(existsSync(join(out, "AGENTS.md"))).toBe(true);
+      // CLAUDE.md
+      const claude = readFileSync(join(out, "CLAUDE.md"), "utf8");
+      expect(claude).toContain("Claude Code");
+      expect(claude).toContain("no-emojis");
+      // .cursor/rules/operator-hard.mdc · alwaysApply
+      const hardMdc = readFileSync(join(out, ".cursor", "rules", "operator-hard.mdc"), "utf8");
+      expect(hardMdc).toContain("alwaysApply: true");
+      expect(hardMdc).toContain("no-emojis");
+      // .cursor/rules/operator-conventions.mdc · agent-requested
+      const softMdc = readFileSync(
+        join(out, ".cursor", "rules", "operator-conventions.mdc"),
+        "utf8",
+      );
+      expect(softMdc).toContain("alwaysApply: false");
+      expect(softMdc).toContain("prefer-typed");
+      // .gemini/instructions.md
+      const gemini = readFileSync(join(out, ".gemini", "instructions.md"), "utf8");
+      expect(gemini).toContain("Gemini CLI");
+      expect(gemini).toContain("no-emojis");
+    } finally {
+      cleanupDir(out);
+    }
+  });
+
+  test("emit-companions --target agents writes only AGENTS.md", () => {
+    runCli(dir, ["save-rule", "a-rule", "--description", "test", "--content", "body"]);
+    const out = makeTempDir();
+    try {
+      runCli(dir, ["emit-companions", "--out", out, "--target", "agents"]);
+      expect(existsSync(join(out, "AGENTS.md"))).toBe(true);
+      expect(existsSync(join(out, "CLAUDE.md"))).toBe(false);
+      expect(existsSync(join(out, ".cursor", "rules"))).toBe(false);
+      expect(existsSync(join(out, ".gemini"))).toBe(false);
+    } finally {
+      cleanupDir(out);
+    }
+  });
+
+  test("emit-companions --target claude,cursor writes only those two", () => {
+    runCli(dir, [
+      "save-rule",
+      "h-rule",
+      "--description",
+      "hard rule",
+      "--severity",
+      "hard",
+      "--content",
+      "body",
+    ]);
+    const out = makeTempDir();
+    try {
+      runCli(dir, ["emit-companions", "--out", out, "--target", "claude,cursor"]);
+      expect(existsSync(join(out, "CLAUDE.md"))).toBe(true);
+      expect(existsSync(join(out, ".cursor", "rules", "operator-hard.mdc"))).toBe(true);
+      expect(existsSync(join(out, "AGENTS.md"))).toBe(false);
+      expect(existsSync(join(out, ".gemini"))).toBe(false);
+    } finally {
+      cleanupDir(out);
+    }
+  });
+
+  test("emit-companions on empty store writes placeholder Cursor MDC + others", () => {
+    const out = makeTempDir();
+    try {
+      const r = runCli(dir, ["emit-companions", "--out", out]);
+      expect(r.exitCode).toBe(0);
+      // AGENTS.md + CLAUDE.md + gemini are placeholder
+      const agents = readFileSync(join(out, "AGENTS.md"), "utf8");
+      expect(agents).toContain("No rules defined yet");
+      // Cursor MDC placeholder
+      const placeholder = readFileSync(join(out, ".cursor", "rules", "operator-rules.mdc"), "utf8");
+      expect(placeholder).toContain("No rules defined yet");
+      expect(placeholder).toContain("alwaysApply: false");
+    } finally {
+      cleanupDir(out);
+    }
+  });
+
+  test("Cursor hard-rules MDC stays under 150 lines for sane rule counts", () => {
+    // Add 5 hard rules — should fit comfortably under the Cursor cap.
+    for (let i = 0; i < 5; i++) {
+      runCli(dir, [
+        "save-rule",
+        `hard-${i}`,
+        "--description",
+        `Hard rule ${i}`,
+        "--severity",
+        "hard",
+        "--content",
+        `Body for hard rule ${i}.`,
+      ]);
+    }
+    const out = makeTempDir();
+    try {
+      runCli(dir, ["emit-companions", "--out", out, "--target", "cursor"]);
+      const mdc = readFileSync(join(out, ".cursor", "rules", "operator-hard.mdc"), "utf8");
+      const lineCount = mdc.split("\n").length;
+      expect(lineCount).toBeLessThan(150);
+    } finally {
+      cleanupDir(out);
+    }
+  });
+
   test("AGENTS.md round-trips rule body content", () => {
     runCli(dir, [
       "save-rule",
