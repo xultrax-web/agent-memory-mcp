@@ -30,6 +30,7 @@ import {
   ListToolsRequestSchema,
   ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import Fuse from "fuse.js";
 import matter from "gray-matter";
 import {
   existsSync,
@@ -354,69 +355,163 @@ function toolGetMemory(args: Record<string, unknown>): string {
 
 function toolListMemories(args: Record<string, unknown>): string {
   const typeFilter = args.type ? String(args.type) : null;
+  const offset = args.offset ? Math.max(0, Number(args.offset)) : 0;
+  const limit = args.limit ? Math.max(1, Number(args.limit)) : 50;
+
   const names = listMemoryFiles();
-  const memories = names
+  const all = names
     .map((n) => readMemory(n))
     .filter((m): m is Memory => m !== null)
     .filter((m) => !typeFilter || m.type === typeFilter)
     .sort((a, b) => a.name.localeCompare(b.name));
 
-  if (memories.length === 0) {
+  if (all.length === 0) {
     return typeFilter
       ? `No memories of type "${typeFilter}".`
       : "No memories yet. Use save_memory to create one.";
   }
 
-  const lines = [`Found ${memories.length} memor${memories.length === 1 ? "y" : "ies"}:`, ""];
-  for (const m of memories) {
+  const page = all.slice(offset, offset + limit);
+  const lines: string[] = [];
+  const showing =
+    offset === 0 && page.length === all.length
+      ? `Found ${all.length} memor${all.length === 1 ? "y" : "ies"}:`
+      : `Showing ${offset + 1}-${offset + page.length} of ${all.length}:`;
+  lines.push(showing);
+  lines.push("");
+  for (const m of page) {
     lines.push(`  ${m.name}  [${m.type}]`);
     lines.push(`    ${m.description}`);
+  }
+  if (offset + page.length < all.length) {
+    const nextOffset = offset + page.length;
+    lines.push("");
+    lines.push(`  ... ${all.length - nextOffset} more. Use offset=${nextOffset} to continue.`);
   }
   return lines.join("\n");
 }
 
+// -------------------------------------------------------------
+// Fuzzy search · Fuse.js with field weighting + snippets
+// -------------------------------------------------------------
+//
+// Why Fuse over BM25 / Lunr: memory documents are small (1-10KB)
+// and queries are short (3-5 words). Fuse gives typo tolerance,
+// word-order tolerance, and partial-match support out of the box,
+// with field weighting that approximates TF-IDF on this data size.
+// BM25 would be over-engineering at this scale.
+//
+// Field weights (name×3 > description×2 > body×1) match the
+// natural intuition: a hit in the slug or summary is more
+// meaningful than a single hit in 5KB of prose.
+
+function buildFuse(memories: Memory[]): Fuse<Memory> {
+  return new Fuse(memories, {
+    includeScore: true,
+    includeMatches: true,
+    threshold: 0.4, // 0=exact, 1=anything; 0.4 is forgiving without going noisy
+    ignoreLocation: true,
+    minMatchCharLength: 2,
+    keys: [
+      { name: "name", weight: 3 },
+      { name: "description", weight: 2 },
+      { name: "body", weight: 1 },
+    ],
+  });
+}
+
+type FuseResultMatch = NonNullable<ReturnType<Fuse<Memory>["search"]>[number]["matches"]>[number];
+
+function extractFuseSnippet(memory: Memory, matches: readonly FuseResultMatch[]): string | null {
+  // Prefer a body-field snippet so the operator sees context, not the
+  // memory's own description (which is already in the summary line).
+  const bodyMatch = matches.find((m) => m.key === "body");
+  if (!bodyMatch || !bodyMatch.indices?.length) return null;
+  const text = memory.body;
+  const [start, end] = bodyMatch.indices[0];
+  const ctxStart = Math.max(0, start - 40);
+  const ctxEnd = Math.min(text.length, end + 1 + 40);
+  let snippet = text.slice(ctxStart, ctxEnd).replace(/\s+/g, " ").trim();
+  if (ctxStart > 0) snippet = "... " + snippet;
+  if (ctxEnd < text.length) snippet = snippet + " ...";
+  return snippet;
+}
+
 function toolSearchMemories(args: Record<string, unknown>): string {
-  const query = String(args.query ?? "")
-    .trim()
-    .toLowerCase();
+  const query = String(args.query ?? "").trim();
   if (!query) throw new Error("query is required");
+  const limit = args.limit ? Math.max(1, Number(args.limit)) : 10;
 
   const names = listMemoryFiles();
   const memories = names.map((n) => readMemory(n)).filter((m): m is Memory => m !== null);
+  if (memories.length === 0) return "No memories to search.";
 
-  // Naive ranking: name match > description match > body match.
-  // Score: name=10, description=5, body=1 per occurrence.
-  const scored = memories
-    .map((m) => {
-      const nameHits = (m.name.toLowerCase().match(new RegExp(escapeRegex(query), "g")) || [])
-        .length;
-      const descHits = (
-        m.description.toLowerCase().match(new RegExp(escapeRegex(query), "g")) || []
-      ).length;
-      const bodyHits = (m.body.toLowerCase().match(new RegExp(escapeRegex(query), "g")) || [])
-        .length;
-      const score = nameHits * 10 + descHits * 5 + bodyHits;
-      return { mem: m, score, bodyHits };
-    })
-    .filter((r) => r.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 10);
+  const fuse = buildFuse(memories);
+  const results = fuse.search(query, { limit });
 
-  if (scored.length === 0) return `No memories matched "${query}".`;
+  if (results.length === 0) {
+    return `No memories matched "${query}". (Fuzzy threshold 0.4; try a shorter or simpler query.)`;
+  }
 
-  const lines = [
-    `Found ${scored.length} match${scored.length === 1 ? "" : "es"} for "${query}":`,
-    "",
-  ];
-  for (const r of scored) {
-    lines.push(`  ${r.mem.name}  [${r.mem.type}]  (score ${r.score})`);
-    lines.push(`    ${r.mem.description}`);
-    if (r.bodyHits > 0) {
-      const snippet = extractSnippet(r.mem.body, query);
-      if (snippet) lines.push(`    ... ${snippet}`);
-    }
+  const lines: string[] = [];
+  lines.push(`Found ${results.length} match${results.length === 1 ? "" : "es"} for "${query}":`);
+  lines.push("");
+  for (const r of results) {
+    const m = r.item;
+    // Fuse score: 0 = perfect, 1 = no match. Invert + scale for human display.
+    const relevance = Math.round((1 - (r.score ?? 0)) * 100);
+    lines.push(
+      `  ${c(ANSI.bold, m.name)}  [${m.type}]  ${c(ANSI.dim, `· relevance ${relevance}%`)}`,
+    );
+    lines.push(`    ${m.description}`);
+    const snippet = extractFuseSnippet(m, r.matches ?? []);
+    if (snippet) lines.push(`    ${c(ANSI.dim, snippet)}`);
   }
   return lines.join("\n");
+}
+
+// -------------------------------------------------------------
+// Relevant memories · for LLM consumption (full content)
+// -------------------------------------------------------------
+//
+// Where search_memories returns human-readable matches with snippets,
+// relevant_memories returns the FULL memory bodies. The intended
+// caller is an LLM asking "what do I know about X?" so it can pull
+// just-in-time context without a second round trip.
+//
+// Default max=5 keeps the context window cost bounded.
+
+function toolRelevantMemories(args: Record<string, unknown>): string {
+  const query = String(args.query ?? "").trim();
+  if (!query) throw new Error("query is required");
+  const max = args.max ? Math.max(1, Math.min(20, Number(args.max))) : 5;
+
+  const names = listMemoryFiles();
+  const memories = names.map((n) => readMemory(n)).filter((m): m is Memory => m !== null);
+  if (memories.length === 0) return "No memories available.";
+
+  const fuse = buildFuse(memories);
+  const results = fuse.search(query, { limit: max });
+
+  if (results.length === 0) {
+    return `No memories relevant to "${query}".`;
+  }
+
+  // Emit each memory as a markdown section so the LLM can ingest
+  // multiple memories in one shot without further parsing.
+  const sections: string[] = [];
+  sections.push(`# Memories relevant to "${query}"\n`);
+  for (const r of results) {
+    const m = r.item;
+    const relevance = Math.round((1 - (r.score ?? 0)) * 100);
+    sections.push(`## ${m.name} · [${m.type}] · relevance ${relevance}%`);
+    sections.push(`> ${m.description}`);
+    sections.push("");
+    sections.push(m.body);
+    sections.push("");
+    sections.push("---");
+  }
+  return sections.join("\n");
 }
 
 function toolDeleteMemory(args: Record<string, unknown>): string {
@@ -696,18 +791,6 @@ function actionColor(action: string): string {
   return ANSI.dim;
 }
 
-function extractSnippet(body: string, query: string): string | null {
-  const idx = body.toLowerCase().indexOf(query.toLowerCase());
-  if (idx < 0) return null;
-  const start = Math.max(0, idx - 40);
-  const end = Math.min(body.length, idx + query.length + 40);
-  return body.slice(start, end).replace(/\s+/g, " ").trim();
-}
-
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 // -------------------------------------------------------------
 // Server wiring
 // -------------------------------------------------------------
@@ -824,13 +907,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "search_memories",
       description:
-        "Substring search across all memories (name + description + body). Returns top 10 by relevance.",
+        "Fuzzy search across name, description, and body. Tolerates typos, word-order shifts, and partial matches. Returns top matches with relevance scores (0-100) and body-context snippets. Use this for human-readable browsing.",
       inputSchema: {
         type: "object",
         properties: {
           query: {
             type: "string",
-            description: "What to look for. Case-insensitive substring match.",
+            description: "What to look for. Fuzzy match (typo-tolerant).",
+          },
+          limit: { type: "number", description: "Max results to return (default 10)." },
+        },
+        required: ["query"],
+      },
+    },
+    {
+      name: "relevant_memories",
+      description:
+        "Find memories relevant to a query and return their FULL content (not summaries). Designed for LLM ingestion — call this when the assistant needs context on a topic and the memory index alone isn't specific enough. Returns up to `max` memories as a markdown document.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "The topic the assistant needs context on." },
+          max: {
+            type: "number",
+            description: "Max memories to include (default 5, capped at 20).",
           },
         },
         required: ["query"],
@@ -849,7 +949,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "list_memories",
-      description: "List all stored memories, optionally filtered by type.",
+      description: "List stored memories, optionally filtered by type. Paginated.",
       inputSchema: {
         type: "object",
         properties: {
@@ -858,6 +958,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             enum: ["user", "feedback", "project", "reference"],
             description: "Optional filter — only list memories of this type",
           },
+          offset: { type: "number", description: "Skip this many results (default 0)." },
+          limit: { type: "number", description: "Max results per page (default 50)." },
         },
       },
     },
@@ -934,6 +1036,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "search_memories":
         result = toolSearchMemories(args);
         break;
+      case "relevant_memories":
+        result = toolRelevantMemories(args);
+        break;
       case "get_memory":
         result = toolGetMemory(args);
         break;
@@ -980,6 +1085,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 const CLI_COMMANDS = new Set([
   "save",
   "search",
+  "relevant",
   "get",
   "list",
   "delete",
@@ -1067,8 +1173,24 @@ async function cliMain(command: string, rest: string[]): Promise<number> {
       }
       case "search": {
         const query = positional[0];
-        if (!query) throw new Error("Usage: agent-memory search <query>");
-        process.stdout.write(toolSearchMemories({ query }) + "\n");
+        if (!query) throw new Error("Usage: agent-memory search <query> [--limit N]");
+        process.stdout.write(
+          toolSearchMemories({
+            query,
+            limit: flags.limit ? Number(flags.limit) : undefined,
+          }) + "\n",
+        );
+        return 0;
+      }
+      case "relevant": {
+        const query = positional[0];
+        if (!query) throw new Error("Usage: agent-memory relevant <query> [--max N]");
+        process.stdout.write(
+          toolRelevantMemories({
+            query,
+            max: flags.max ? Number(flags.max) : undefined,
+          }) + "\n",
+        );
         return 0;
       }
       case "get": {
@@ -1078,7 +1200,13 @@ async function cliMain(command: string, rest: string[]): Promise<number> {
         return 0;
       }
       case "list": {
-        process.stdout.write(toolListMemories({ type: flags.type }) + "\n");
+        process.stdout.write(
+          toolListMemories({
+            type: flags.type,
+            offset: flags.offset ? Number(flags.offset) : undefined,
+            limit: flags.limit ? Number(flags.limit) : undefined,
+          }) + "\n",
+        );
         return 0;
       }
       case "delete": {
@@ -1143,9 +1271,11 @@ COMMANDS
                                            Save or update a memory.
                                            Type: user | feedback | project | reference
                                            Content sources: --content "..." | --content-file <path> | --stdin
-  search <query>                           Substring search (top 10 by relevance)
+  search <query> [--limit N]               Fuzzy search (typo-tolerant), top N (default 10)
+  relevant <query> [--max N]               Top N matches as full markdown for LLM ingestion
   get <name>                               Print one memory's full contents
-  list [--type <t>]                        List all memories (optionally by type)
+  list [--type <t>] [--offset N] [--limit N]
+                                           List memories (paginated, default limit 50)
   delete <name>                            Soft-delete: move to .trash/, removable later
   restore <name>                           Restore the most recent trash entry for <name>
   doctor [--rebuild-index]                 Check storage integrity (orphans, dangling

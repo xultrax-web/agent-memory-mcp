@@ -184,17 +184,18 @@ Custom path:
 
 ## Tools
 
-| Tool              | Purpose                                                                                                                                        |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `save_memory`     | Create or update a memory. Atomic write + locked. Validates name + type. Updates the index.                                                    |
-| `search_memories` | Substring search across name, description, and body. Returns top 10 by relevance score.                                                        |
-| `get_memory`      | Fetch one memory by name. Returns frontmatter + body.                                                                                          |
-| `list_memories`   | List all memories. Optional `type` filter.                                                                                                     |
-| `delete_memory`   | Soft delete: moves the memory to `.trash/<ts>-<name>.md`. Recoverable until you empty `.trash/` by hand.                                       |
-| `restore_memory`  | Restore a soft-deleted memory from `.trash/`. Picks the most recent trash entry for the name.                                                  |
-| `doctor`          | Storage integrity check. Reports orphans, dangling index entries, unreadable files. Pass `rebuild-index=true` to repair `MEMORY.md` from disk. |
-| `stats`           | Dashboard: counts per type, total size, largest memory, audit-log size, trash count.                                                           |
-| `log_events`      | Read recent entries from the audit event log. Optional `tail` (default 20) + `action` filter.                                                  |
+| Tool                | Purpose                                                                                                                                        |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `save_memory`       | Create or update a memory. Atomic write + locked. Validates name + type. Updates the index.                                                    |
+| `search_memories`   | Fuzzy search (Fuse.js · typo-tolerant, word-order tolerant, partial matches). Returns top N with relevance 0-100 + body snippet.               |
+| `relevant_memories` | Same matching as search, but returns full memory bodies as one markdown doc. Built for LLM auto-context.                                       |
+| `get_memory`        | Fetch one memory by name. Returns frontmatter + body.                                                                                          |
+| `list_memories`     | List memories. Optional `type` filter. Paginated (default 50/page).                                                                            |
+| `delete_memory`     | Soft delete: moves the memory to `.trash/<ts>-<name>.md`. Recoverable until you empty `.trash/` by hand.                                       |
+| `restore_memory`    | Restore a soft-deleted memory from `.trash/`. Picks the most recent trash entry for the name.                                                  |
+| `doctor`            | Storage integrity check. Reports orphans, dangling index entries, unreadable files. Pass `rebuild-index=true` to repair `MEMORY.md` from disk. |
+| `stats`             | Dashboard: counts per type, total size, largest memory, audit-log size, trash count.                                                           |
+| `log_events`        | Read recent entries from the audit event log. Optional `tail` (default 20) + `action` filter.                                                  |
 
 ### Memory types
 
@@ -215,8 +216,11 @@ The same binary is also a command-line tool. Useful in shell scripts, git hooks,
 agent-memory save user-likes-tabs --type user --description "Prefers tabs" --content "Always use tabs in new files."
 agent-memory list
 agent-memory list --type feedback
-agent-memory search "tabs"
+agent-memory search "tabs"                    # fuzzy, top 10 by relevance
+agent-memory search "depoy" --limit 5         # typo-tolerant ("depoy" → "deploy")
+agent-memory relevant "deployment" --max 3    # full memory bodies, LLM-ready
 agent-memory get user-likes-tabs
+agent-memory list --limit 20 --offset 40      # pagination
 agent-memory delete user-likes-tabs           # soft delete — moves to .trash/
 agent-memory restore user-likes-tabs          # restore the most recent trash entry
 agent-memory doctor                            # check integrity
@@ -311,11 +315,17 @@ This server is built to be used daily, not to demo well once.
 - **Structured stderr logging** — `AGENT_MEMORY_LOG=debug|info|warn|error`; safe to use alongside MCP stdio.
 - **Color output** — auto-detected via TTY, respects `NO_COLOR` / `FORCE_COLOR`.
 
-**Landing in v0.5 - v0.7:**
+**Shipped in v0.5:**
+
+- **Fuse.js fuzzy search** with field weights (name×3, description×2, body×1). Typo, partial, and word-order tolerant.
+- **Snippet highlighting** — body-context excerpts shown under each match with `...` markers.
+- **Relevance scoring** — Fuse score inverted + scaled to 0-100 for human readability.
+- **`relevant_memories(query, max=5)`** — sister tool to search that returns FULL memory bodies as a single markdown doc, built for LLM auto-context loading.
+- **Pagination** — `offset` + `limit` on `list_memories` and `limit` on `search_memories`.
+
+**Landing in v0.6 - v0.7:**
 
 - Read-only mode (`AGENT_MEMORY_READ_ONLY=1`)
-- Fuse.js fuzzy search + BM25 ranking + snippet highlighting
-- `relevant_memories(query, max=5)` smart auto-context tool
 - Comprehensive Vitest suite + CI matrix
 - Multi-client compatibility verification (Cursor, Cline, Claude Desktop, Continue)
 
