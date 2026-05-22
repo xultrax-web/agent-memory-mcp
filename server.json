@@ -1,0 +1,43 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.xultrax-web/agent-memory-mcp",
+  "description": "Markdown memory for AI agents. Files you can read, edit, grep, and commit. Not a database.",
+  "repository": {
+    "url": "https://github.com/xultrax-web/agent-memory-mcp",
+    "source": "github"
+  },
+  "version": "0.6.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@xultrax-web/agent-memory-mcp",
+      "version": "0.6.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "AGENT_MEMORY_DIR",
+          "description": "Absolute path to a custom memory storage directory. Overrides the default per-project location.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
+        },
+        {
+          "name": "AGENT_MEMORY_SCOPE",
+          "description": "Set to 'global' to store memories in ~/.agent-memory/ instead of the per-project default ./.agent-memory/.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
+        },
+        {
+          "name": "AGENT_MEMORY_LOG",
+          "description": "Log level: debug | info | warn | error. Defaults to info. Logs go to stderr (won't pollute MCP stdio).",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

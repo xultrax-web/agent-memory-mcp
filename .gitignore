@@ -5,3 +5,8 @@ dist/
 .agent-memory/
 .cli-test/
 .agent-memory-test/
+
+# mcp-publisher binary (downloaded per platform, not committed)
+mcp-publisher
+mcp-publisher.exe
+mcp-publisher.tar.gz
