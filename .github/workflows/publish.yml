@@ -42,6 +42,11 @@ jobs:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
+      # OIDC Trusted Publishing requires npm 11.5+. Node 22 LTS ships
+      # with npm 10.x, so bump the npm CLI explicitly before publishing.
+      - name: Upgrade npm to latest (required for OIDC trusted publishing)
+        run: npm install -g npm@latest
+
       - name: Verify tag matches package.json version
         run: |
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
