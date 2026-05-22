@@ -1,8 +1,8 @@
 {
   "name": "@xultrax-web/agent-memory-mcp",
-  "version": "0.11.5",
+  "version": "0.11.6",
   "mcpName": "io.github.xultrax-web/agent-memory-mcp",
-  "description": "Markdown memory for AI agents. Plain files you can read, edit, grep, and commit. Operator-grade storage with atomic writes, file locking, tags, [[wiki-links]], find_related, git-backed multi-machine sync, and an Ink-based TUI.",
+  "description": "Codify how you work. Every AI tool obeys. Markdown rules + cross-tool companion files (AGENTS.md/CLAUDE.md/.cursor/rules/.gemini) + Compliance Receipts for protocol-level enforcement of destructive ops. Reference implementation of CRP 1.0. Works on every MCP client (no Sampling required).",
   "type": "module",
   "bin": {
     "agent-memory-mcp": "dist/index.js",

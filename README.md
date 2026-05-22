@@ -1,15 +1,20 @@
 # agent-memory-mcp
 
-> Markdown memory for AI agents. Your data is just files.
+> Codify how you work. Every AI tool obeys.
 
 [![CI](https://github.com/xultrax-web/agent-memory-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/xultrax-web/agent-memory-mcp/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](https://nodejs.org)
 [![MCP](https://img.shields.io/badge/MCP-server-blueviolet)](https://modelcontextprotocol.io)
 
-**Markdown memory for AI agents.** Plain files in a directory you control — read them, edit them, grep them, commit them. Operator-grade storage primitives (atomic writes, file locking, soft-delete to `.trash/`, schema versioning, doctor command) wrap the files so nothing rots in the long tail.
+**Memory as constraint, not just recall.** Plain markdown files in a directory you control. Capture your rules + recipes + decisions + context once, applied everywhere — across sessions, across machines, across every AI tool you use.
 
-You can `cat` your memory. You can `grep` it. You can edit it in vim. You can commit it to git. You can move it between machines with `scp` or with the built-in `agent-memory sync` (git-backed). If the AI gets a memory wrong, you fix it in a text editor and save. No migration scripts. No vendor lock-in.
+The wedge:
+
+1. **Rules are first-class memories.** Tag with severity (hard / soft), scope, enforce_on category, regex patterns, last_verified date.
+2. **Companion files emit automatically** to `AGENTS.md` (Linux-Foundation universal standard), `CLAUDE.md` (Claude Code's 5-level hierarchy), `.cursor/rules/*.mdc` (Cursor MDC), and `.gemini/instructions.md` — your rules show up in every tool, every session, with no plugin needed.
+3. **`check_action` gates destructive operations.** Agent proposes an action, server matches against your rule store, and either issues a [Compliance Receipt](docs/compliance-receipt-protocol-1.0.md) (HMAC-signed bearer token bound to your rules) or returns a structured rejection naming the rule that blocked.
+4. **Plain files all the way down.** You can `cat` your memory, `grep` it, edit it in vim, commit it to git, sync it to another machine via the built-in `agent-memory sync`. If the AI gets it wrong, you fix it in a text editor and save. No migration scripts. No vendor lock-in. Reference implementation of the [Compliance Receipt Protocol 1.0](docs/compliance-receipt-protocol-1.0.md) — other MCP servers can adopt the same receipts and interoperate.
 
 ---
 

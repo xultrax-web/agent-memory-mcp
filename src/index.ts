@@ -2558,7 +2558,7 @@ function actionColor(action: string): string {
 // -------------------------------------------------------------
 
 const server = new Server(
-  { name: "agent-memory", version: "0.11.4" },
+  { name: "agent-memory", version: "0.11.6" },
   { capabilities: { tools: {}, resources: {}, prompts: {} } },
 );
 
