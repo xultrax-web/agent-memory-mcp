@@ -22,7 +22,9 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
+  ListResourcesRequestSchema,
   ListToolsRequestSchema,
+  ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import matter from "gray-matter";
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
@@ -272,9 +274,79 @@ function escapeRegex(s: string): string {
 // -------------------------------------------------------------
 
 const server = new Server(
-  { name: "agent-memory", version: "0.1.0" },
-  { capabilities: { tools: {} } },
+  { name: "agent-memory", version: "0.2.0" },
+  { capabilities: { tools: {}, resources: {} } },
 );
+
+// -------------------------------------------------------------
+// Resource URI scheme
+// -------------------------------------------------------------
+//
+//   agent-memory://index              → the MEMORY.md index
+//   agent-memory://memory/{name}      → an individual memory file
+//
+// Clients (Cursor, Claude Desktop, etc.) can pin the index as
+// always-visible context. Per-memory URIs are exposed so a client
+// can pin specific memories the user marks as "always relevant"
+// (e.g. their user profile memory, the project's prime directive).
+
+const URI_INDEX = "agent-memory://index";
+const URI_MEMORY_PREFIX = "agent-memory://memory/";
+
+server.setRequestHandler(ListResourcesRequestSchema, async () => {
+  ensureStorage();
+  const memories = listMemoryFiles()
+    .map((n) => readMemory(n))
+    .filter((m): m is Memory => m !== null)
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  return {
+    resources: [
+      {
+        uri: URI_INDEX,
+        name: "Memory index",
+        description:
+          "Auto-managed index of every stored memory. Pin this as always-visible context so the assistant sees what's known before deciding what to look up.",
+        mimeType: "text/markdown",
+      },
+      ...memories.map((m) => ({
+        uri: `${URI_MEMORY_PREFIX}${m.name}`,
+        name: m.name,
+        description: `[${m.type}] ${m.description}`,
+        mimeType: "text/markdown",
+      })),
+    ],
+  };
+});
+
+server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+  const uri = request.params.uri;
+  ensureStorage();
+
+  if (uri === URI_INDEX) {
+    const text = readFileSync(INDEX_FILE, "utf8");
+    return { contents: [{ uri, mimeType: "text/markdown", text }] };
+  }
+
+  if (uri.startsWith(URI_MEMORY_PREFIX)) {
+    const name = uri.slice(URI_MEMORY_PREFIX.length);
+    // Defense in depth: strict slug validation prevents path traversal
+    // even though the URI parser should already reject "../" segments.
+    if (!SLUG_PATTERN.test(name)) {
+      throw new Error(`Invalid memory name in URI: "${name}"`);
+    }
+    const fp = memoryFilePath(name);
+    if (!existsSync(fp)) {
+      throw new Error(`Resource not found: ${uri}`);
+    }
+    const text = readFileSync(fp, "utf8");
+    return { contents: [{ uri, mimeType: "text/markdown", text }] };
+  }
+
+  throw new Error(
+    `Unknown resource URI: ${uri}. Supported: ${URI_INDEX}, ${URI_MEMORY_PREFIX}{name}`,
+  );
+});
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
