@@ -419,16 +419,6 @@ This server is built to be used daily, not to demo well once.
 - **`find_backlinks`** tool + `agent-memory backlinks <name>` CLI — "what links to this".
 - **`find_related`** tool + `agent-memory related <name>` CLI — combines outbound + inbound links, shared tags, type match, and content similarity into a ranked discovery view.
 
-**Shipped in v0.10 · the visual identity (TUI):**
-
-- **`agent-memory ui`** — Ink-based terminal UI for browsing, filtering, searching, and editing memories without leaving the terminal.
-- Type-filter quick-keys (0-4 cycle through all/user/feedback/project/reference)
-- Fuzzy live search with `/`
-- `e` opens the highlighted memory in `$EDITOR` (vim/notepad/nano/whatever) — saves back to disk
-- `d` soft-deletes with `y/n` confirmation
-- Detail pane previews the body of the selected memory
-- Color-coded by type, tag chips inline
-
 **Shipped in v0.9 · the moat — multi-machine memory via git:**
 
 - **`agent-memory sync init <remote-url>`** — convert `.agent-memory/` into a git repo, push to remote.
@@ -439,6 +429,16 @@ This server is built to be used daily, not to demo well once.
 - **`sync_status` / `sync_push` / `sync_pull` MCP tools** — the LLM can do this too.
 - Per-machine state (`.lock`, `.events.jsonl`, `.trash/`) auto-excluded from sync.
 - Default commit identity injected (`agent-memory@local`) so machines without `git config --global user.email` work without setup.
+
+**Shipped in v0.10 · the visual identity (TUI):**
+
+- **`agent-memory ui`** — Ink-based terminal UI for browsing, filtering, searching, and editing memories without leaving the terminal.
+- Type-filter quick-keys (0-4 cycle through all/user/feedback/project/reference)
+- Fuzzy live search with `/`
+- `e` opens the highlighted memory in `$EDITOR` (vim/notepad/nano/whatever) — saves back to disk
+- `d` soft-deletes with `y/n` confirmation
+- Detail pane previews the body of the selected memory
+- Color-coded by type, tag chips inline
 
 **Landing in v0.11+:**
 
@@ -451,15 +451,33 @@ This server is built to be used daily, not to demo well once.
 
 ## Roadmap
 
-- **v0.2** — MCP Resources support, Claude Code import script (`agent-memory import-claude-code`), CLI mode
-- **v0.3** — Atomic writes, soft delete, schema versioning, doctor command
-- **v0.4** — Structured event log, stats command, color output
-- **v0.5** — Fuzzy search (Fuse.js), BM25 ranking, snippet highlighting
-- **v0.7** — Comprehensive test suite, multi-client compatibility matrix
-- **v0.9** — npm publish + MCP Registry submission
-- **v1.0** — Public launch
+### Released
 
-Beyond v1.0: sync backends (git remote, S3), web UI, team mode, browser extension, optional embeddings sidecar.
+| Version   | Highlights                                                                                          |
+| --------- | --------------------------------------------------------------------------------------------------- |
+| v0.1      | Five-tool MVP, file storage, four-client config snippets                                            |
+| v0.2      | MCP Resources, Claude Code import (`agent-memory import-claude-code`), CLI mode, prettier baseline  |
+| v0.3      | Atomic writes, file locking, soft delete + `restore_memory`, `doctor` repair, schema versioning     |
+| v0.4      | Append-only event log (`.events.jsonl`), `stats` dashboard, `log_events` browser, color output      |
+| v0.5      | Fuzzy search via Fuse.js, relevance scoring, body-context snippets, `relevant_memories`, pagination |
+| v0.6      | 25+ Vitest tests, GitHub Actions CI (Node 20/22/24 matrix), `COMPATIBILITY.md`                      |
+| v0.7      | MCP Prompts (4 starter workflows), `verify_memory`, conflict detection on save                      |
+| v0.8      | Tags, `[[wiki-links]]`, `find_backlinks`, `find_related`                                            |
+| v0.8.1    | Trusted Publishing live · tokenless OIDC publishes to npm + MCP Registry on git tag                 |
+| **v0.9**  | **`agent-memory sync` · multi-machine memory via git remote (init/push/pull/status/log)**           |
+| **v0.10** | **Ink-based TUI · `agent-memory ui` for visual browsing, search, and editing**                      |
+
+### Coming next
+
+- Folder support inside the store (`.agent-memory/work/`, `.agent-memory/personal/`) for multi-context separation
+- Auto-context loading — server hook that auto-fires `relevant_memories` before each LLM turn so context flows transparently
+- Memory packs — export/import shareable `.tar.gz` bundles of curated memories
+- Browser companion UI (`agent-memory web`) for non-terminal users
+- TUI polish — file-watching for auto-refresh, inline editing, sync push/pull as keybindings
+
+### Beyond
+
+Optional local-embeddings sidecar (transformers.js, no API), team mode with diff/merge, browser extension to capture from chatgpt.com / claude.ai → memory, mobile companion.
 
 Open an issue if you want one of these before I get to it.
 
