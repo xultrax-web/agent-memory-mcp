@@ -1,0 +1,43 @@
+{
+  "name": "agent-memory-mcp",
+  "version": "0.1.0",
+  "description": "File-based persistent memory for any MCP client. Markdown + frontmatter. Inspired by Claude Code's built-in memory pattern, available to Cursor, Cline, Continue, and any other MCP-compatible tool.",
+  "type": "module",
+  "bin": {
+    "agent-memory-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "memory",
+    "ai",
+    "claude",
+    "cursor",
+    "cline",
+    "continue",
+    "persistent-memory",
+    "agent"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "gray-matter": "^4.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
