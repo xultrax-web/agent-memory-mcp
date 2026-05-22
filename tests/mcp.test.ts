@@ -1,0 +1,94 @@
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { cleanupDir, makeTempDir, runMcp } from "./helpers.js";
+
+let dir: string;
+beforeEach(() => {
+  dir = makeTempDir();
+});
+afterEach(() => {
+  cleanupDir(dir);
+});
+
+describe("MCP · server protocol", () => {
+  test("tools/list returns 10 tools", async () => {
+    const responses = await runMcp(dir, [{ jsonrpc: "2.0", id: 1, method: "tools/list" }]);
+    expect(responses).toHaveLength(1);
+    const tools = (responses[0] as { result: { tools: { name: string }[] } }).result.tools;
+    const names = tools.map((t) => t.name).sort();
+    expect(names).toEqual([
+      "delete_memory",
+      "doctor",
+      "get_memory",
+      "list_memories",
+      "log_events",
+      "relevant_memories",
+      "restore_memory",
+      "save_memory",
+      "search_memories",
+      "stats",
+    ]);
+  });
+
+  test("save → resources/list → resources/read round-trip", async () => {
+    const responses = await runMcp(dir, [
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "save_memory",
+          arguments: {
+            name: "mcp-test",
+            type: "user",
+            description: "MCP round-trip test",
+            content: "MCP body content",
+          },
+        },
+      },
+      { jsonrpc: "2.0", id: 2, method: "resources/list" },
+      {
+        jsonrpc: "2.0",
+        id: 3,
+        method: "resources/read",
+        params: { uri: "agent-memory://memory/mcp-test" },
+      },
+    ]);
+
+    expect(responses).toHaveLength(3);
+
+    const listed = (responses[1] as { result: { resources: { uri: string }[] } }).result.resources;
+    expect(listed.some((r) => r.uri === "agent-memory://index")).toBe(true);
+    expect(listed.some((r) => r.uri === "agent-memory://memory/mcp-test")).toBe(true);
+
+    const read = (responses[2] as { result: { contents: { text: string }[] } }).result.contents[0];
+    expect(read.text).toContain("MCP body content");
+    expect(read.text).toContain("schema: 1");
+  });
+
+  test("path traversal in resource URI is rejected", async () => {
+    const responses = await runMcp(dir, [
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "resources/read",
+        params: { uri: "agent-memory://memory/../etc/passwd" },
+      },
+    ]);
+    expect(responses).toHaveLength(1);
+    expect(responses[0]).toHaveProperty("error");
+    const err = (responses[0] as { error: { message: string } }).error;
+    expect(err.message).toMatch(/Invalid memory name/i);
+  });
+
+  test("unknown resource URI returns error", async () => {
+    const responses = await runMcp(dir, [
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "resources/read",
+        params: { uri: "agent-memory://nonsense/foo" },
+      },
+    ]);
+    expect(responses[0]).toHaveProperty("error");
+  });
+});

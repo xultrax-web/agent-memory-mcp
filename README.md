@@ -2,6 +2,7 @@
 
 > Markdown memory for AI agents. Your data is just files.
 
+[![CI](https://github.com/xultrax-web/agent-memory-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/xultrax-web/agent-memory-mcp/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg)](https://nodejs.org)
 [![MCP](https://img.shields.io/badge/MCP-server-blueviolet)](https://modelcontextprotocol.io)
@@ -323,11 +324,17 @@ This server is built to be used daily, not to demo well once.
 - **`relevant_memories(query, max=5)`** — sister tool to search that returns FULL memory bodies as a single markdown doc, built for LLM auto-context loading.
 - **Pagination** — `offset` + `limit` on `list_memories` and `limit` on `search_memories`.
 
-**Landing in v0.6 - v0.7:**
+**Shipped in v0.6:**
+
+- **Vitest test suite** — 20+ blackbox tests covering CLI + MCP server paths.
+- **GitHub Actions CI** — runs tests on every push/PR across Node 18/20/22.
+- **[COMPATIBILITY.md](COMPATIBILITY.md)** — known-working client matrix + quirks.
+
+**Landing in v0.7:**
 
 - Read-only mode (`AGENT_MEMORY_READ_ONLY=1`)
-- Comprehensive Vitest suite + CI matrix
-- Multi-client compatibility verification (Cursor, Cline, Claude Desktop, Continue)
+- Live multi-client verification (Cursor, Cline, Claude Desktop, Continue)
+- Demo GIF / screencast
 
 ---
 
