@@ -312,6 +312,7 @@ CRP narrows the Macaroon model to a specific use case (MCP destructive-tool gati
 
 ## Change log
 
-| Version | Date       | Notes                                                |
-| ------- | ---------- | ---------------------------------------------------- |
-| 1.0     | 2026-05-22 | Initial draft. Reference implementation in v0.11.2+. |
+| Version | Date       | Notes                                                                                                         |
+| ------- | ---------- | ------------------------------------------------------------------------------------------------------------- |
+| 1.0     | 2026-05-22 | Initial draft. Reference implementation in v0.11.2+.                                                          |
+| 1.1     | 2026-05-22 | Ed25519 asymmetric signing for cross-server federation. Reference implementation in agent-memory-mcp v0.13.0. |
