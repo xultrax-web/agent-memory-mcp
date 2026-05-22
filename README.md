@@ -14,7 +14,7 @@ You can `cat` your memory. You can `grep` it. You can edit it in vim. You can co
 
 ## What you get
 
-```
+```text
 .agent-memory/
 ├── MEMORY.md                           # auto-managed index
 ├── user-prefers-tabs.md
@@ -137,6 +137,7 @@ Cline → MCP Servers → Add:
 ```
 
 > **Windows note:** if `npx` doesn't resolve cleanly, wrap with `cmd /c`:
+>
 > ```json
 > { "command": "cmd", "args": ["/c", "npx", "-y", "github:xultrax-web/agent-memory-mcp"] }
 > ```
@@ -183,13 +184,13 @@ Custom path:
 
 ## Tools
 
-| Tool | Purpose |
-|---|---|
-| `save_memory` | Create or update a memory. Validates the name (kebab-case) and type. Updates the index. |
+| Tool              | Purpose                                                                                 |
+| ----------------- | --------------------------------------------------------------------------------------- |
+| `save_memory`     | Create or update a memory. Validates the name (kebab-case) and type. Updates the index. |
 | `search_memories` | Substring search across name, description, and body. Returns top 10 by relevance score. |
-| `get_memory` | Fetch one memory by name. Returns frontmatter + body. |
-| `list_memories` | List all memories. Optional `type` filter. |
-| `delete_memory` | Remove a memory file and its index entry. |
+| `get_memory`      | Fetch one memory by name. Returns frontmatter + body.                                   |
+| `list_memories`   | List all memories. Optional `type` filter.                                              |
+| `delete_memory`   | Remove a memory file and its index entry.                                               |
 
 ### Memory types
 
@@ -202,18 +203,60 @@ Four built-in types, matching the Claude Code convention:
 
 ---
 
+## CLI
+
+The same binary is also a command-line tool. Useful in shell scripts, git hooks, cron, or just for quick lookups outside your editor.
+
+```bash
+agent-memory save user-likes-tabs --type user --description "Prefers tabs" --content "Always use tabs in new files."
+agent-memory list
+agent-memory list --type feedback
+agent-memory search "tabs"
+agent-memory get user-likes-tabs
+agent-memory delete user-likes-tabs
+```
+
+Multi-line content can come from a file or stdin:
+
+```bash
+agent-memory save my-handoff --type project --description "Q3 handoff notes" --content-file handoff.md
+cat conversation.txt | agent-memory save extracted-prefs --type user --description "Pulled from chat" --stdin
+```
+
+### Importing from Claude Code
+
+If you've been using Claude Code's built-in memory, bring it over:
+
+```bash
+# See what would be imported (dry run, no writes)
+agent-memory import-claude-code --dry-run
+
+# Filter to one project by substring match (case-insensitive)
+agent-memory import-claude-code --project prefixcheck --dry-run
+
+# Do the import
+agent-memory import-claude-code --project prefixcheck
+
+# Replace existing memories with the same names
+agent-memory import-claude-code --project prefixcheck --overwrite
+```
+
+The importer walks `~/.claude/projects/*/memory/`, parses each memory's YAML frontmatter (tolerantly — malformed files don't kill the run), flattens Claude Code's `metadata.type` field to top-level `type`, and writes to your current store. Existing memories with the same name are skipped unless you pass `--overwrite`.
+
+---
+
 ## How it compares
 
 The memory MCP landscape, as of May 2026:
 
-| Server | Backend | Hand-editable? | Greppable? | Git-friendly? |
-|---|---|---|---|---|
-| **agent-memory-mcp (this)** | **Markdown files** | **Yes** | **Yes** | **Yes** |
-| `@modelcontextprotocol/server-memory` (official) | Knowledge graph (JSON) | No (raw JSON) | Limited | Painful merges |
-| memory-graph/memory-graph | Graph DB | No | No | No |
-| IzumiSy/mcp-duckdb-memory-server | DuckDB | No | No | No |
-| sdimitrov/mcp-memory | Postgres + pgvector | No | No | No |
-| JovanHsu/mcp-neo4j-memory-server | Neo4j | No | No | No |
+| Server                                           | Backend                | Hand-editable? | Greppable? | Git-friendly?  |
+| ------------------------------------------------ | ---------------------- | -------------- | ---------- | -------------- |
+| **agent-memory-mcp (this)**                      | **Markdown files**     | **Yes**        | **Yes**    | **Yes**        |
+| `@modelcontextprotocol/server-memory` (official) | Knowledge graph (JSON) | No (raw JSON)  | Limited    | Painful merges |
+| memory-graph/memory-graph                        | Graph DB               | No             | No         | No             |
+| IzumiSy/mcp-duckdb-memory-server                 | DuckDB                 | No             | No         | No             |
+| sdimitrov/mcp-memory                             | Postgres + pgvector    | No             | No         | No             |
+| JovanHsu/mcp-neo4j-memory-server                 | Neo4j                  | No             | No         | No             |
 
 **The trade you're making:** you give up native semantic similarity search and structured entity-relation queries. You get a memory store that survives every tool change, every machine swap, every "wait, what was that AI telling me about this codebase six months ago?"
 
