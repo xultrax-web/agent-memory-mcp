@@ -280,7 +280,7 @@ describe("audit · denial + unreceipted-delete surfaces", () => {
     expect(report.recent_denials[0].hard_count).toBe(1);
   });
 
-  test("unreceipted delete is surfaced", async () => {
+  test("attempted unreceipted delete is refused + surfaces as a refused event in audit (v0.12.0)", async () => {
     runCli(dir, ["save", "tmp", "--type", "project", "--description", "x", "--content", "y"]);
     await runMcp(dir, [
       {
@@ -290,7 +290,13 @@ describe("audit · denial + unreceipted-delete surfaces", () => {
         params: { name: "delete_memory", arguments: { name: "tmp" } },
       },
     ]);
-    const report = auditJson(dir) as { recent_unreceipted_deletes: { name: string }[] };
+    const report = auditJson(dir) as {
+      recent_unreceipted_deletes: { name: string }[];
+    };
+    // v0.12.0: the delete was REFUSED · audit's recent_unreceipted_deletes
+    // surfaces BOTH the historical "delete_without_receipt" (v0.11.x success
+    // with warning) AND the new "delete_refused_no_receipt" event. Either way,
+    // the operator sees the attempt.
     expect(report.recent_unreceipted_deletes.length).toBeGreaterThanOrEqual(1);
     expect(report.recent_unreceipted_deletes[0].name).toBe("tmp");
   });

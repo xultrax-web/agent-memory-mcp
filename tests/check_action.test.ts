@@ -321,7 +321,7 @@ describe("delete_memory · receipt-gated path", () => {
     expect(delText.toLowerCase()).toMatch(/refused|missing required caveat/);
   });
 
-  test("delete without receipt still succeeds (v0.11.3 back-compat) but logs", async () => {
+  test("delete without receipt is REFUSED (v0.12.0 breaking change)", async () => {
     runCli(dir, ["save", "to-delete", "--type", "project", "--description", "x", "--content", "y"]);
     const delResp = await runMcp(dir, [
       {
@@ -333,8 +333,7 @@ describe("delete_memory · receipt-gated path", () => {
     ]);
     const delText = (delResp[0] as { result: { content: [{ text: string }] } }).result.content[0]
       .text;
-    expect(delText).toContain("Moved");
-    expect(delText).toContain("no receipt");
+    expect(delText.toLowerCase()).toContain("receipt required");
   });
 });
 

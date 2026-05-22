@@ -741,28 +741,31 @@ export function toolDeleteMemory(args: Record<string, unknown>): string {
   const fp = memoryFilePath(name);
   if (!existsSync(fp)) return `Memory "${name}" not found.`;
 
-  // v0.11.3 · receipt-gated path. If a receipt is supplied, validate it
-  // against the current rule set + required caveats. If validation fails,
-  // refuse the delete with a clear reason. If no receipt is supplied,
-  // proceed (back-compat) but log so audit can surface the gap. v0.12
-  // will require receipts unconditionally for destructive ops.
+  // v0.12.0 · receipt REQUIRED for delete_memory. The v0.11.x back-compat
+  // path (delete without receipt) is removed. Callers MUST first call
+  // check_action({action_type: 'deletions'}) to obtain a fresh receipt,
+  // then pass it to delete_memory as the `receipt` argument.
   const receipt = parseReceiptArg(args.receipt);
-  if (receipt) {
-    const v = validateReceipt(receipt, {
-      required_caveats: [{ type: "action_type", value: "deletions" }],
-    });
-    if (!v.valid) {
-      logEvent("delete_denied", { name, reason: v.reason, receipt_id: receipt.id });
-      throw new Error(
-        `delete_memory refused · receipt invalid (${v.reason}). ` +
-          `Call check_action({action: 'delete memory ${name}', action_type: 'deletions'}) ` +
-          `to get a fresh receipt.`,
-      );
-    }
-    logEvent("delete_approved_via_receipt", { name, receipt_id: receipt.id });
-  } else {
-    logEvent("delete_without_receipt", { name });
+  if (!receipt) {
+    logEvent("delete_refused_no_receipt", { name });
+    throw new Error(
+      `delete_memory refused · receipt required (v0.12.0+). ` +
+        `Call check_action({action: 'delete memory ${name}', action_type: 'deletions'}) ` +
+        `first, then pass the issued receipt as the 'receipt' argument to delete_memory.`,
+    );
   }
+  const v = validateReceipt(receipt, {
+    required_caveats: [{ type: "action_type", value: "deletions" }],
+  });
+  if (!v.valid) {
+    logEvent("delete_denied", { name, reason: v.reason, receipt_id: receipt.id });
+    throw new Error(
+      `delete_memory refused · receipt invalid (${v.reason}). ` +
+        `Call check_action({action: 'delete memory ${name}', action_type: 'deletions'}) ` +
+        `to get a fresh receipt.`,
+    );
+  }
+  logEvent("delete_approved_via_receipt", { name, receipt_id: receipt.id });
 
   return withLock(() => {
     ensureTrash();
@@ -772,12 +775,9 @@ export function toolDeleteMemory(args: Record<string, unknown>): string {
     const trashPath = join(TRASH_DIR, `${ts}-${name}.md`);
     renameSync(fp, trashPath);
     removeIndexEntryUnlocked(name);
-    logEvent("delete", { name, trash: `${ts}-${name}.md`, gated: !!receipt });
+    logEvent("delete", { name, trash: `${ts}-${name}.md`, gated: true });
     log("debug", "delete_memory", { name });
-    const gateMsg = receipt
-      ? ` (gated by receipt ${receipt.id})`
-      : " (no receipt · v0.11.3 back-compat path)";
-    return `Moved "${name}" to trash${gateMsg}. Restore with: agent-memory restore ${name}`;
+    return `Moved "${name}" to trash (gated by receipt ${receipt.id}). Restore with: agent-memory restore ${name}`;
   });
 }
 
@@ -2193,7 +2193,14 @@ function recentDenials(): RecentDenial[] {
 }
 
 function recentUnreceiptedDeletes(): UnreceiptedDelete[] {
-  const records = readEventLog({ tail: AUDIT_EVENT_TAIL, action: "delete_without_receipt" });
+  // v0.11.x emitted "delete_without_receipt" when an unreceipted delete
+  // succeeded. v0.12.0 emits "delete_refused_no_receipt" when refusing.
+  // We surface BOTH event types so an audit run against pre-v0.12 logs
+  // still reports historical unreceipted deletes correctly.
+  const records = [
+    ...readEventLog({ tail: AUDIT_EVENT_TAIL, action: "delete_without_receipt" }),
+    ...readEventLog({ tail: AUDIT_EVENT_TAIL, action: "delete_refused_no_receipt" }),
+  ];
   return records.map((r) => ({
     ts: String(r.ts),
     name: String(r.name ?? ""),
@@ -2670,7 +2677,7 @@ function actionColor(action: string): string {
 // -------------------------------------------------------------
 
 const server = new Server(
-  { name: "agent-memory", version: "0.11.7" },
+  { name: "agent-memory", version: "0.12.0" },
   { capabilities: { tools: {}, resources: {}, prompts: {} } },
 );
 
@@ -3044,19 +3051,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: "delete_memory",
       description:
         "Move a memory to .trash/ (soft delete). The file is removed from the index but recoverable via restore_memory until you manually empty .trash/. " +
-        "v0.11.3+ accepts an optional `receipt` argument · pass a Compliance Receipt from check_action({action_type: 'deletions'}) to gate the delete against the rule store. " +
+        "v0.12.0+ · receipt REQUIRED. Caller MUST first call check_action({action: 'delete memory <name>', action_type: 'deletions'}) to obtain a fresh Compliance Receipt, then pass it to this tool as `receipt`. " +
         "Receipts must carry the caveat {type: 'action_type', value: 'deletions'} or the delete refuses. " +
-        "Receipts not supplied are accepted (back-compat) but logged · v0.12 will require them.",
+        "Migration from v0.11.x: previously unreceipted deletes were accepted with a warning · now they throw. Add a check_action call before each delete_memory call.",
       inputSchema: {
         type: "object",
         properties: {
           name: { type: "string", description: "The memory's name slug" },
           receipt: {
             description:
-              "Optional Compliance Receipt (object or JSON string) from check_action. v0.11.3 logs unreceipted deletes but doesn't block them yet.",
+              "REQUIRED · Compliance Receipt (object or JSON string) from check_action with action_type=deletions. Without this, the delete is refused.",
           },
         },
-        required: ["name"],
+        required: ["name", "receipt"],
       },
     },
     {
@@ -3557,7 +3564,19 @@ async function cliMain(command: string, rest: string[]): Promise<number> {
       case "delete": {
         const name = positional[0];
         if (!name) throw new Error("Usage: agent-memory delete <name>");
-        process.stdout.write(toolDeleteMemory({ name }) + "\n");
+        // v0.12.0+ · delete_memory requires a Compliance Receipt. The CLI
+        // is the trusted operator path (a human is running the command,
+        // not an AI agent), so we auto-issue a CLI-scoped receipt rather
+        // than make the operator chain `check-action` then paste JSON.
+        // MCP callers (AI agents) still must go through check_action
+        // explicitly — this short-circuit only fires from the CLI binary.
+        const receipt = issueReceipt({
+          caveats: [
+            { type: "action_type", value: "deletions" },
+            { type: "issued_by", value: "cli" },
+          ],
+        });
+        process.stdout.write(toolDeleteMemory({ name, receipt: JSON.stringify(receipt) }) + "\n");
         return 0;
       }
       case "restore": {
