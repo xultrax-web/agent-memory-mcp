@@ -53,6 +53,7 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -78,6 +79,10 @@ const INDEX_FILE = join(MEMORY_DIR, "MEMORY.md");
 const TRASH_DIR = join(MEMORY_DIR, ".trash");
 const LOCK_FILE = join(MEMORY_DIR, ".lock");
 const EVENT_LOG = join(MEMORY_DIR, ".events.jsonl");
+// Per-machine ledger of already-used receipt ids (single-use enforcement).
+const CONSUMED_RECEIPTS_FILE = join(MEMORY_DIR, ".consumed-receipts.jsonl");
+// Rotate the append-only event log past this size so it never grows unbounded.
+const EVENT_LOG_MAX_BYTES = 5 * 1024 * 1024;
 const SCHEMA_VERSION = 1;
 
 // -------------------------------------------------------------
@@ -141,6 +146,15 @@ interface EventRecord {
 function logEvent(action: string, fields: Record<string, unknown>): void {
   try {
     ensureStorage();
+    // Rotate when the log grows past the cap so it never grows without bound.
+    // Keeps one previous generation (.events.jsonl.1); best-effort.
+    try {
+      if (existsSync(EVENT_LOG) && statSync(EVENT_LOG).size > EVENT_LOG_MAX_BYTES) {
+        renameSync(EVENT_LOG, `${EVENT_LOG}.1`);
+      }
+    } catch {
+      /* rotation is best-effort; never block the event write */
+    }
     const record: EventRecord = { ts: new Date().toISOString(), action, ...fields };
     // Append is safe across processes on POSIX + Windows for small lines
     // (writev guarantees atomicity below pipe buffer size). For larger
@@ -204,7 +218,9 @@ function ensureLockTarget(): void {
 //                     don't corrupt the index
 
 function atomicWriteFile(filePath: string, content: string): void {
-  const tmpPath = `${filePath}.tmp.${process.pid}`;
+  // Unique tmp name (pid + random) so concurrent writers — even within the
+  // same process — never collide on the temp file before the atomic rename.
+  const tmpPath = `${filePath}.tmp.${process.pid}.${randomBytes(4).toString("hex")}`;
   writeFileSync(tmpPath, content, "utf8");
   renameSync(tmpPath, filePath);
 }
@@ -765,19 +781,34 @@ export function toolDeleteMemory(args: Record<string, unknown>): string {
     );
   }
   const v = validateReceipt(receipt, {
-    required_caveats: [{ type: "action_type", value: "deletions" }],
+    required_caveats: [
+      { type: "action_type", value: "deletions" },
+      // Bind the receipt to deleting THIS memory — not just "some deletion".
+      // Without this, a receipt minted for "delete memory A" could delete B.
+      { type: "action_hash", value: deletionActionHash(name) },
+    ],
   });
   if (!v.valid) {
     logEvent("delete_denied", { name, reason: v.reason, receipt_id: receipt.id });
     throw new Error(
       `delete_memory refused · receipt invalid (${v.reason}). ` +
         `Call check_action({action: 'delete memory ${name}', action_type: 'deletions'}) ` +
-        `to get a fresh receipt.`,
+        `to get a fresh receipt bound to this memory.`,
     );
   }
-  logEvent("delete_approved_via_receipt", { name, receipt_id: receipt.id });
 
   return withLock(() => {
+    // Single-use · reject a receipt that already deleted something (replay).
+    // Checked + consumed inside the lock so two callers can't double-spend one.
+    if (isReceiptConsumed(receipt.id)) {
+      logEvent("delete_denied", { name, reason: "receipt already used", receipt_id: receipt.id });
+      throw new Error(
+        `delete_memory refused · receipt ${receipt.id} was already used. ` +
+          `Receipts are single-use — call check_action again for a fresh one.`,
+      );
+    }
+    // Re-check existence inside the lock (it may have moved since the early check).
+    if (!existsSync(fp)) return `Memory "${name}" not found.`;
     ensureTrash();
     // Trash filename: <unix-ms>-<name>.md so restore can pick the
     // most recent version and the operator can see when it was binned.
@@ -785,6 +816,8 @@ export function toolDeleteMemory(args: Record<string, unknown>): string {
     const trashPath = join(TRASH_DIR, `${ts}-${name}.md`);
     renameSync(fp, trashPath);
     removeIndexEntryUnlocked(name);
+    consumeReceipt(receipt.id, receipt.expires_at);
+    logEvent("delete_approved_via_receipt", { name, receipt_id: receipt.id });
     logEvent("delete", { name, trash: `${ts}-${name}.md`, gated: true });
     log("debug", "delete_memory", { name });
     return `Moved "${name}" to trash (gated by receipt ${receipt.id}). Restore with: agent-memory restore ${name}`;
@@ -835,6 +868,7 @@ interface DoctorReport {
   dangling: string[]; // in index, no file
   unreadable: string[]; // parse errors
   invalidType: string[]; // type not in VALID_TYPES
+  keyringTracked: boolean; // SECURITY · signing secret committed to git
   rebuilt: boolean;
 }
 
@@ -878,6 +912,17 @@ function runDoctor(rebuildIndex: boolean): DoctorReport {
     rebuilt = true;
   }
 
+  // SECURITY · if the store is a git repo, the signing key must never be tracked.
+  let keyringTracked = false;
+  try {
+    if (isGitRepo()) {
+      const tracked = git(["ls-files", ".keyring"]);
+      keyringTracked = tracked.exitCode === 0 && tracked.stdout.trim().length > 0;
+    }
+  } catch {
+    /* best-effort — doctor never throws on the git probe */
+  }
+
   return {
     storageDir: MEMORY_DIR,
     diskFiles,
@@ -886,6 +931,7 @@ function runDoctor(rebuildIndex: boolean): DoctorReport {
     dangling,
     unreadable,
     invalidType,
+    keyringTracked,
     rebuilt,
   };
 }
@@ -898,10 +944,23 @@ function formatDoctorReport(r: DoctorReport, rebuildRequested: boolean): string 
   lines.push(`indexed : ${r.indexEntries.length}`);
   lines.push("");
 
+  // SECURITY warning takes priority — surfaced regardless of index issues.
+  if (r.keyringTracked) {
+    lines.push(c(ANSI.red, "⚠ SECURITY · .keyring is tracked by git — the receipt-signing"));
+    lines.push("  secret may be committed/pushed; anyone with repo access can forge receipts.");
+    lines.push("  Fix: `agent-memory sync push` (auto-untracks it) + purge it from git history,");
+    lines.push("  then `agent-memory rotate-key` to invalidate the exposed key.");
+    lines.push("");
+  }
+
   const issueCount =
     r.orphans.length + r.dangling.length + r.unreadable.length + r.invalidType.length;
   if (issueCount === 0) {
-    lines.push("OK · no issues found");
+    lines.push(
+      r.keyringTracked
+        ? "No index issues · but resolve the SECURITY warning above."
+        : "OK · no issues found",
+    );
     return lines.join("\n");
   }
 
@@ -1520,6 +1579,29 @@ function toolSaveRule(args: Record<string, unknown>): string {
   if (!description) throw new Error("description is required");
   if (!content) throw new Error("content is required");
 
+  // Reject match patterns that won't compile or that risk catastrophic
+  // backtracking (ReDoS). Failing fast here keeps a dangerous rule out of the
+  // store; checkActionAgainstRules also defends at execution time for rules
+  // that arrive by hand-edit / import / federation.
+  if (matches) {
+    for (const pat of matches) {
+      if (!isRegexSafe(pat)) {
+        throw new Error(
+          `Unsafe regex in matches: ${JSON.stringify(pat)}. It risks catastrophic ` +
+            `backtracking (ReDoS) — avoid nested unbounded quantifiers like (a+)+ or (.*)*. ` +
+            `Rewrite it in a bounded form and try again.`,
+        );
+      }
+      try {
+        new RegExp(pat, "i");
+      } catch (e) {
+        throw new Error(
+          `Invalid regex in matches: ${JSON.stringify(pat)} · ${(e as Error).message}`,
+        );
+      }
+    }
+  }
+
   ensureStorage();
 
   const extras: string[] = [];
@@ -1673,6 +1755,57 @@ function loadOrCreateEd25519Keys(): { privateKeyPem: string; publicKeyPem: strin
 export function exportEd25519PublicKey(): string | null {
   if (!existsSync(ED25519_PUB_FILE)) return null;
   return readFileSync(ED25519_PUB_FILE, "utf8");
+}
+
+/**
+ * Rotate the receipt-signing key material. Overwrites the HMAC key (and, when
+ * present or explicitly requested, the Ed25519 keypair) with freshly generated
+ * secrets. This is the correct response to a suspected key leak: every
+ * outstanding receipt was signed with the old key, so all of them immediately
+ * stop verifying. Returns the list of rotated artifacts.
+ */
+export function rotateSigningKeys(mode: "hmac" | "ed25519" | "both" = "both"): string[] {
+  if (!existsSync(KEYRING_DIR)) mkdirSync(KEYRING_DIR, { recursive: true });
+  const rotated: string[] = [];
+  if (mode === "hmac" || mode === "both") {
+    writeFileSync(HMAC_KEY_FILE, randomBytes(32), { mode: 0o600 });
+    rotated.push("hmac-key");
+  }
+  if (mode === "ed25519" || (mode === "both" && existsSync(ED25519_PRIV_FILE))) {
+    const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+    writeFileSync(
+      ED25519_PRIV_FILE,
+      privateKey.export({ format: "pem", type: "pkcs8" }) as string,
+      {
+        mode: 0o600,
+      },
+    );
+    writeFileSync(ED25519_PUB_FILE, publicKey.export({ format: "pem", type: "spki" }) as string, {
+      mode: 0o644,
+    });
+    rotated.push("ed25519-keypair");
+  }
+  return rotated;
+}
+
+function toolRotateKey(args: Record<string, unknown>): string {
+  const modeArg = String(args.mode ?? "both").trim();
+  const mode = modeArg === "hmac" || modeArg === "ed25519" ? modeArg : "both";
+  const rotated = rotateSigningKeys(mode);
+  // Old receipt ids can never be re-presented (their signatures are dead), so
+  // the single-use ledger is moot — clear it to reclaim the space.
+  try {
+    if (existsSync(CONSUMED_RECEIPTS_FILE))
+      renameSync(CONSUMED_RECEIPTS_FILE, `${CONSUMED_RECEIPTS_FILE}.bak`);
+  } catch {
+    /* best-effort */
+  }
+  logEvent("rotate_key", { mode, rotated });
+  return (
+    `Rotated signing key material: ${rotated.length ? rotated.join(", ") : "(nothing — keyring absent)"}.\n` +
+    `⚠ All previously issued Compliance Receipts are now INVALID (signatures no longer verify).\n` +
+    `If the old key was ever committed or pushed, also remove it from the remote's history and audit who had access.`
+  );
 }
 
 /**
@@ -1861,6 +1994,61 @@ export function validateReceipt(
 }
 
 // -------------------------------------------------------------
+// Single-use receipt enforcement (replay protection)
+// -------------------------------------------------------------
+//
+// validateReceipt proves a receipt is authentic + unexpired + matches the
+// rule set + carries the required caveats — but on its own a receipt is
+// reusable for its whole TTL. For destructive ops we additionally require
+// each receipt to be used at most once. Consumed ids are persisted to a
+// per-machine ledger (jsonl of {id, expires_at}); expired entries are pruned
+// on every read so it never grows without bound. The file is gitignored and
+// never synced.
+
+function readConsumedReceipts(): Map<string, number> {
+  const live = new Map<string, number>();
+  if (!existsSync(CONSUMED_RECEIPTS_FILE)) return live;
+  const now = Math.floor(Date.now() / 1000);
+  for (const line of readFileSync(CONSUMED_RECEIPTS_FILE, "utf8").split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const e = JSON.parse(line) as { id?: unknown; expires_at?: unknown };
+      if (typeof e.id === "string" && typeof e.expires_at === "number" && e.expires_at >= now) {
+        live.set(e.id, e.expires_at);
+      }
+    } catch {
+      // skip malformed line
+    }
+  }
+  return live;
+}
+
+function isReceiptConsumed(id: string): boolean {
+  return readConsumedReceipts().has(id);
+}
+
+/** Mark a receipt id consumed. Rewrites the ledger pruned of expired ids. */
+function consumeReceipt(id: string, expiresAt: number): void {
+  const live = readConsumedReceipts();
+  live.set(id, expiresAt);
+  const body = Array.from(live.entries())
+    .map(([rid, exp]) => JSON.stringify({ id: rid, expires_at: exp }))
+    .join("\n");
+  atomicWriteFile(CONSUMED_RECEIPTS_FILE, body ? body + "\n" : "");
+}
+
+/**
+ * The action-hash a delete receipt MUST carry, computed the same way
+ * check_action hashes its `action` (sha256 → first 16 hex) over the exact
+ * canonical string the delete_memory guidance instructs callers to use. This
+ * binds a receipt to deleting THIS memory: a receipt minted for "delete
+ * memory A" cannot be presented to delete memory B.
+ */
+function deletionActionHash(name: string): string {
+  return createHash("sha256").update(`delete memory ${name}`).digest("hex").slice(0, 16);
+}
+
+// -------------------------------------------------------------
 // check_action · v0.11.3 · the protocol enforcement point
 // -------------------------------------------------------------
 //
@@ -1902,7 +2090,46 @@ export interface CheckActionResult {
   rules_evaluated: number;
 }
 
+/**
+ * Reject regex patterns prone to catastrophic backtracking (ReDoS). Heuristic:
+ * flags "star height >= 2" — an unbounded quantifier (*, +, {n,}) applied to a
+ * group that already contains an unbounded quantifier, e.g. (a+)+, (a*)*, (.*)+.
+ * Conservative (may reject some safe-but-deeply-nested patterns) but never
+ * accepts a known-dangerous shape. Escaped metacharacters are ignored.
+ */
+export function isRegexSafe(pattern: string): boolean {
+  if (pattern.length > 1000) return false;
+  const src = pattern.replace(/\\./g, ""); // drop escaped metachars (\+, \*, \{)
+  const groupHasUnbounded: boolean[] = []; // per open group: contains unbounded quantifier?
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === "(") {
+      groupHasUnbounded.push(false);
+    } else if (ch === ")") {
+      const inner = groupHasUnbounded.pop() ?? false;
+      const rest = src.slice(i + 1);
+      const quantified = rest[0] === "*" || rest[0] === "+" || /^\{\d*,\}/.test(rest);
+      if (quantified && inner) return false; // unbounded quantifier over unbounded inner
+      if (quantified && groupHasUnbounded.length > 0)
+        groupHasUnbounded[groupHasUnbounded.length - 1] = true;
+    } else if (ch === "*" || ch === "+") {
+      if (groupHasUnbounded.length > 0) groupHasUnbounded[groupHasUnbounded.length - 1] = true;
+    } else if (ch === "{") {
+      if (/^\{\d*,\}/.test(src.slice(i)) && groupHasUnbounded.length > 0)
+        groupHasUnbounded[groupHasUnbounded.length - 1] = true;
+    }
+  }
+  return true;
+}
+
 function safeRegex(pattern: string): RegExp | null {
+  // Skip ReDoS-prone patterns rather than risk hanging the event loop. These
+  // are blocked at save_rule, but a hand-edited / imported / federated rule
+  // file can still carry one, so we defend at execution time too.
+  if (!isRegexSafe(pattern)) {
+    log("warn", "skipping ReDoS-prone rule pattern", { pattern });
+    return null;
+  }
   try {
     return new RegExp(pattern, "i");
   } catch {
@@ -1928,6 +2155,8 @@ export function checkActionAgainstRules(
   const rules = loadAllRules();
   const hard: RuleViolation[] = [];
   const soft: RuleViolation[] = [];
+  // Cap the tested string · bounds worst-case regex work regardless of pattern.
+  const tested = action.length > 4096 ? action.slice(0, 4096) : action;
 
   for (const rule of rules) {
     // Scope filter · if enforce_on is specified, the action's type must be
@@ -1943,7 +2172,7 @@ export function checkActionAgainstRules(
     for (const pat of rule.matches) {
       const re = safeRegex(pat);
       if (!re) continue;
-      if (re.test(action)) {
+      if (re.test(tested)) {
         const violation: RuleViolation = {
           rule: rule.name,
           severity: rule.severity ?? "soft",
@@ -2431,7 +2660,35 @@ const SYNC_GITIGNORE =
   "# Per-machine state · do not sync across devices\n" +
   ".lock\n" +
   ".events.jsonl\n" +
-  ".trash/\n";
+  ".trash/\n" +
+  // SECURITY · the keyring holds the receipt-signing secret (HMAC key /
+  // Ed25519 private key). It must NEVER be committed or pushed — a leaked
+  // key lets anyone forge Compliance Receipts. Excluded from sync always.
+  ".keyring/\n" +
+  // Single-use receipt ledger is per-machine runtime state, not shared.
+  ".consumed-receipts.jsonl\n";
+
+/**
+ * Defense-in-depth for the sync feature. Rewrites .gitignore to the current
+ * policy (so repos created by an older version pick up the `.keyring/`
+ * exclusion) and untracks any secret / per-machine file a stale .gitignore
+ * may have already committed. `--ignore-unmatch` makes the untrack a no-op
+ * when nothing sensitive was ever staged. Call before every `git add`.
+ */
+function ensureSyncHygiene(): void {
+  writeFileSync(join(MEMORY_DIR, ".gitignore"), SYNC_GITIGNORE, "utf8");
+  git([
+    "rm",
+    "-r",
+    "--cached",
+    "--ignore-unmatch",
+    ".keyring",
+    ".consumed-receipts.jsonl",
+    ".lock",
+    ".events.jsonl",
+    ".trash",
+  ]);
+}
 
 interface GitResult {
   stdout: string;
@@ -2490,7 +2747,7 @@ function toolSyncInit(args: Record<string, unknown>): string {
   const init = git(["init", "-b", "main"]);
   if (init.exitCode !== 0) throw new Error(`git init failed: ${init.stderr}`);
 
-  writeFileSync(join(MEMORY_DIR, ".gitignore"), SYNC_GITIGNORE, "utf8");
+  ensureSyncHygiene();
 
   const addRemote = git(["remote", "add", "origin", remoteUrl]);
   if (addRemote.exitCode !== 0) throw new Error(`git remote add failed: ${addRemote.stderr}`);
@@ -2583,6 +2840,10 @@ function toolSyncPush(args: Record<string, unknown>): string {
   const message = args.message
     ? String(args.message)
     : `agent-memory · sync ${new Date().toISOString().slice(0, 19).replace("T", " ")}Z`;
+
+  // Keep the signing key + per-machine state out of the push (also self-heals
+  // repos created before the .keyring exclusion existed).
+  ensureSyncHygiene();
 
   const add = git(["add", "-A"]);
   if (add.exitCode !== 0) throw new Error(`git add failed: ${add.stderr}`);
@@ -3154,9 +3415,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: "delete_memory",
       description:
         "Move a memory to .trash/ (soft delete). The file is removed from the index but recoverable via restore_memory until you manually empty .trash/. " +
-        "v0.12.0+ · receipt REQUIRED. Caller MUST first call check_action({action: 'delete memory <name>', action_type: 'deletions'}) to obtain a fresh Compliance Receipt, then pass it to this tool as `receipt`. " +
-        "Receipts must carry the caveat {type: 'action_type', value: 'deletions'} or the delete refuses. " +
-        "Migration from v0.11.x: previously unreceipted deletes were accepted with a warning · now they throw. Add a check_action call before each delete_memory call.",
+        "Receipt REQUIRED and bound to THIS memory: first call check_action({action: 'delete memory <name>', action_type: 'deletions'}) — using that EXACT action string — to obtain a fresh Compliance Receipt, then pass it as `receipt`. " +
+        "The receipt must carry {action_type: 'deletions'} AND the matching action_hash for 'delete memory <name>', and is single-use — it cannot be replayed to delete a different memory or the same one twice.",
       inputSchema: {
         type: "object",
         properties: {
@@ -3200,6 +3460,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description:
         "Dashboard of memory-store state: counts per type, total size, largest memory, audit-log size, trash count.",
       inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "rotate_key",
+      description:
+        "Rotate the receipt-signing key material (HMAC and/or Ed25519). Generates fresh keys and INVALIDATES every outstanding Compliance Receipt. Use after a suspected key leak — e.g. the .keyring was ever committed or synced. Optional `mode`: 'hmac' | 'ed25519' | 'both' (default 'both').",
+      inputSchema: {
+        type: "object",
+        properties: {
+          mode: {
+            type: "string",
+            enum: ["hmac", "ed25519", "both"],
+            description: "Which key(s) to rotate. Default 'both'.",
+          },
+        },
+      },
     },
     {
       name: "log_events",
@@ -3503,6 +3778,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "audit":
         result = toolAudit(args);
         break;
+      case "rotate_key":
+        result = toolRotateKey(args);
+        break;
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
@@ -3677,6 +3955,9 @@ async function cliMain(command: string, rest: string[]): Promise<number> {
         const receipt = issueReceipt({
           caveats: [
             { type: "action_type", value: "deletions" },
+            // Bind to THIS memory so the auto-issued CLI receipt satisfies the
+            // same target check the MCP path enforces.
+            { type: "action_hash", value: deletionActionHash(name) },
             { type: "issued_by", value: "cli" },
           ],
         });
@@ -3697,6 +3978,10 @@ async function cliMain(command: string, rest: string[]): Promise<number> {
       }
       case "stats": {
         process.stdout.write(toolStats({}) + "\n");
+        return 0;
+      }
+      case "rotate-key": {
+        process.stdout.write(toolRotateKey({ mode: flags.mode }) + "\n");
         return 0;
       }
       case "verify": {

@@ -29,6 +29,7 @@ describe("MCP · server protocol", () => {
       "log_events",
       "relevant_memories",
       "restore_memory",
+      "rotate_key",
       "save_memory",
       "save_rule",
       "search_memories",
