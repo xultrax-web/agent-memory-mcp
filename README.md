@@ -1,20 +1,21 @@
 # agent-memory-mcp
 
-> Codify how you work. Every AI tool obeys.
+> Guardrails for AI coding agents — write the rule once, every tool obeys, destructive actions get blocked.
 
 [![CI](https://github.com/xultrax-web/agent-memory-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/xultrax-web/agent-memory-mcp/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](https://nodejs.org)
 [![MCP](https://img.shields.io/badge/MCP-server-blueviolet)](https://modelcontextprotocol.io)
 
-**Memory as constraint, not just recall.** Plain markdown files in a directory you control. Capture your rules + recipes + decisions + context once, applied everywhere — across sessions, across machines, across every AI tool you use.
+<!-- 30-second demo: drop the clip here once recorded → ![agent-memory-mcp blocking a destructive action](docs/demo.gif) -->
 
-The wedge:
+Your AI coding agent will eventually try to `rm -rf` the wrong folder, force-push to `main`, or delete the file you actually needed. **agent-memory-mcp** is the memory layer where you write the rule **once**, in plain markdown — and it _enforces itself_:
 
-1. **Rules are first-class memories.** Tag with severity (hard / soft), scope, enforce_on category, regex patterns, last_verified date.
-2. **Companion files emit automatically** to `AGENTS.md` (Linux-Foundation universal standard), `CLAUDE.md` (Claude Code's 5-level hierarchy), `.cursor/rules/*.mdc` (Cursor MDC), and `.gemini/instructions.md` — your rules show up in every tool, every session, with no plugin needed.
-3. **`check_action` gates destructive operations.** Agent proposes an action, server matches against your rule store, and either issues a [Compliance Receipt](docs/compliance-receipt-protocol-1.0.md) (HMAC-signed bearer token bound to your rules) or returns a structured rejection naming the rule that blocked.
-4. **Plain files all the way down.** You can `cat` your memory, `grep` it, edit it in vim, commit it to git, sync it to another machine via the built-in `agent-memory sync`. If the AI gets it wrong, you fix it in a text editor and save. No migration scripts. No vendor lock-in. Reference implementation of the [Compliance Receipt Protocol 1.0](docs/compliance-receipt-protocol-1.0.md) — other MCP servers can adopt the same receipts and interoperate.
+- **Blocks destructive actions at the protocol layer.** The agent proposes an action; the server checks it against your rules and either refuses it or issues a short-lived, signed [Compliance Receipt](docs/compliance-receipt-protocol-1.0.md) it must present to act. Soft rules in a config file get ignored — this doesn't.
+- **One rule, every tool.** Save it once and it emits to `AGENTS.md`, `CLAUDE.md`, `.cursor/rules/`, and `.gemini/` automatically — Claude Code, Cursor, Cline, Copilot, Gemini and Windsurf read the same rules, no plugin.
+- **Plain files you own.** `cat` it, `grep` it, edit it in vim, commit it to git, sync it across machines with `agent-memory sync`. No database, no daemon, no cloud — and if the AI gets it wrong, you fix it in a text editor.
+
+Memory — the rules, recipes, decisions, and context that survive every session and every tool — is the substrate. **Enforcement is the point.** Reference implementation of the [Compliance Receipt Protocol 1.0](docs/compliance-receipt-protocol-1.0.md), so other MCP servers can adopt the same receipts and interoperate.
 
 ---
 
