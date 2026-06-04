@@ -728,7 +728,137 @@ function toolSearchMemories(args: Record<string, unknown>): string {
 //
 // Default max=5 keeps the context window cost bounded.
 
-function toolRelevantMemories(args: Record<string, unknown>): string {
+// Lightweight stopwords so token-overlap ranking keys on meaningful words.
+const STOPWORDS = new Set(
+  "the and or but if then this that these those is are was were be been being do does did have has had how what when where why who which you your our they them my me about can could should would will just not yes for with from".split(
+    " ",
+  ),
+);
+
+function tokenize(s: string): string[] {
+  return (s.toLowerCase().match(/[a-z0-9]+/g) ?? []).filter(
+    (t) => t.length > 2 && !STOPWORDS.has(t),
+  );
+}
+
+/**
+ * Hybrid lexical ranking: Fuse (typo-tolerant precision) blended with
+ * query/body token overlap (recall for reworded queries that share keywords
+ * but not exact strings). Surfaces anything with real signal — fixes the case
+ * where Fuse alone returns nothing for a paraphrase.
+ */
+function lexicalRank(
+  query: string,
+  memories: Memory[],
+  max: number,
+): Array<{ m: Memory; score: number }> {
+  const qTokens = new Set(tokenize(query));
+  const fuse = buildFuse(memories);
+  const fuseScore = new Map<string, number>();
+  for (const r of fuse.search(query)) fuseScore.set(r.item.name, 1 - (r.score ?? 1));
+
+  return memories
+    .map((m) => {
+      const mset = new Set(tokenize(`${m.name} ${m.description} ${m.body}`));
+      let overlap = 0;
+      for (const t of qTokens) if (mset.has(t)) overlap++;
+      const overlapScore = qTokens.size > 0 ? overlap / qTokens.size : 0;
+      const fs = fuseScore.get(m.name) ?? 0;
+      return { m, score: Math.min(1, fs * 0.6 + overlapScore * 0.6), overlap, fs };
+    })
+    .filter((s) => s.fs > 0.2 || s.overlap >= 1)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, max)
+    .map(({ m, score }) => ({ m, score }));
+}
+
+// ---- opt-in semantic recall via a local embeddings endpoint (Ollama) ----
+// Set AGENT_MEMORY_EMBED_MODEL (e.g. "nomic-embed-text"); optional
+// AGENT_MEMORY_EMBED_URL (default http://localhost:11434). Vectors are cached
+// on disk per (model, content-hash) so re-ranking is cheap. Falls back to the
+// lexical ranker silently when unset or the endpoint is unreachable.
+const EMBED_DIR = join(MEMORY_DIR, ".embeddings");
+
+async function embed(text: string, model: string): Promise<number[] | null> {
+  const base = (process.env.AGENT_MEMORY_EMBED_URL ?? "http://localhost:11434").replace(/\/$/, "");
+  try {
+    const res = await fetch(`${base}/api/embeddings`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model, prompt: text }),
+    });
+    if (!res.ok) return null;
+    const j = (await res.json()) as { embedding?: number[] };
+    return Array.isArray(j.embedding) && j.embedding.length > 0 ? j.embedding : null;
+  } catch {
+    return null;
+  }
+}
+
+async function embedMemoryCached(m: Memory, model: string): Promise<number[] | null> {
+  const key = createHash("sha256")
+    .update(model)
+    .update("\0")
+    .update(m.description)
+    .update(m.body)
+    .digest("hex")
+    .slice(0, 16);
+  const dir = join(EMBED_DIR, model.replace(/[^a-z0-9._-]/gi, "_"));
+  const fp = join(dir, `${m.name}.json`);
+  if (existsSync(fp)) {
+    try {
+      const cached = JSON.parse(readFileSync(fp, "utf8")) as { key?: string; vec?: number[] };
+      if (cached.key === key && Array.isArray(cached.vec)) return cached.vec;
+    } catch {
+      /* recompute */
+    }
+  }
+  const vec = await embed(`${m.description}\n\n${m.body}`, model);
+  if (!vec) return null;
+  try {
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    atomicWriteFile(fp, JSON.stringify({ key, vec }));
+  } catch {
+    /* cache is best-effort */
+  }
+  return vec;
+}
+
+function cosine(a: number[], b: number[]): number {
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  return na && nb ? dot / (Math.sqrt(na) * Math.sqrt(nb)) : 0;
+}
+
+async function embedRank(
+  query: string,
+  memories: Memory[],
+  max: number,
+): Promise<Array<{ m: Memory; score: number }> | null> {
+  const model = process.env.AGENT_MEMORY_EMBED_MODEL;
+  if (!model) return null;
+  const qv = await embed(query, model);
+  if (!qv) return null; // endpoint down → caller falls back to lexical
+  const scored: Array<{ m: Memory; score: number }> = [];
+  for (const m of memories) {
+    const mv = await embedMemoryCached(m, model);
+    if (mv) scored.push({ m, score: cosine(qv, mv) });
+  }
+  if (scored.length === 0) return null;
+  return scored
+    .sort((a, b) => b.score - a.score)
+    .slice(0, max)
+    .filter((s) => s.score > 0.25);
+}
+
+async function toolRelevantMemories(args: Record<string, unknown>): Promise<string> {
   const query = String(args.query ?? "").trim();
   if (!query) throw new Error("query is required");
   const max = args.max ? Math.max(1, Math.min(20, Number(args.max))) : 5;
@@ -737,21 +867,17 @@ function toolRelevantMemories(args: Record<string, unknown>): string {
   const memories = names.map((n) => readMemory(n)).filter((m): m is Memory => m !== null);
   if (memories.length === 0) return "No memories available.";
 
-  const fuse = buildFuse(memories);
-  const results = fuse.search(query, { limit: max });
+  // Opt-in semantic ranking when an embeddings endpoint is configured;
+  // otherwise (and on any failure) the hybrid lexical ranker.
+  let ranked = await embedRank(query, memories, max);
+  const method = ranked ? "semantic" : "lexical";
+  if (!ranked) ranked = lexicalRank(query, memories, max);
 
-  if (results.length === 0) {
-    return `No memories relevant to "${query}".`;
-  }
+  if (ranked.length === 0) return `No memories relevant to "${query}".`;
 
-  // Emit each memory as a markdown section so the LLM can ingest
-  // multiple memories in one shot without further parsing.
-  const sections: string[] = [];
-  sections.push(`# Memories relevant to "${query}"\n`);
-  for (const r of results) {
-    const m = r.item;
-    const relevance = Math.round((1 - (r.score ?? 0)) * 100);
-    sections.push(`## ${m.name} · [${m.type}] · relevance ${relevance}%`);
+  const sections: string[] = [`# Memories relevant to "${query}" · ${method}\n`];
+  for (const { m, score } of ranked) {
+    sections.push(`## ${m.name} · [${m.type}] · relevance ${Math.round(score * 100)}%`);
     sections.push(`> ${m.description}`);
     sections.push("");
     sections.push(m.body);
@@ -2666,7 +2792,9 @@ const SYNC_GITIGNORE =
   // key lets anyone forge Compliance Receipts. Excluded from sync always.
   ".keyring/\n" +
   // Single-use receipt ledger is per-machine runtime state, not shared.
-  ".consumed-receipts.jsonl\n";
+  ".consumed-receipts.jsonl\n" +
+  // Embedding cache is per-machine + model-specific and rebuildable.
+  ".embeddings/\n";
 
 /**
  * Defense-in-depth for the sync feature. Rewrites .gitignore to the current
@@ -3477,6 +3605,40 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "init",
+      description:
+        "Install a starter guardrail pack — sensible hard/soft rules (protect main, block rm -rf, no prod data destruction, no curl|sh, flag secrets) — and emit them to every tool's companion files. Zero-config protection on day one. Pass force=true to overwrite same-named rules. Pair with `agent-memory install-hooks` so hard rules actually block tool calls.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          force: {
+            type: "boolean",
+            description: "Overwrite existing starter rules. Default false.",
+          },
+        },
+      },
+    },
+    {
+      name: "validate_receipt",
+      description:
+        "Validate a CRP 1.1 (Ed25519) Compliance Receipt issued by ANOTHER agent-memory server using that server's published public key — no shared secret (the federation primitive). Checks signature, expiry, and required caveats. Pass `receipt` (object or JSON string) and `public_key` (inline PEM or a file path; the issuer gets theirs via `agent-memory export-pubkey`).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          receipt: { description: "The Compliance Receipt to validate (object or JSON string)." },
+          public_key: {
+            type: "string",
+            description: "Issuer's Ed25519 public key · inline PEM or a file path.",
+          },
+          required_caveats: {
+            type: "array",
+            description: "Caveats that must be present (each {type, value}).",
+          },
+        },
+        required: ["receipt", "public_key"],
+      },
+    },
+    {
       name: "log_events",
       description:
         "Read recent entries from the audit event log (.events.jsonl). Returns the last N events, optionally filtered by action.",
@@ -3722,7 +3884,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         result = toolSearchMemories(args);
         break;
       case "relevant_memories":
-        result = toolRelevantMemories(args);
+        result = await toolRelevantMemories(args);
         break;
       case "get_memory":
         result = toolGetMemory(args);
@@ -3781,6 +3943,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "rotate_key":
         result = toolRotateKey(args);
         break;
+      case "init":
+        result = toolInit(args);
+        break;
+      case "validate_receipt":
+        result = toolValidateReceipt(args);
+        break;
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
@@ -3826,6 +3994,10 @@ const CLI_COMMANDS = new Set([
   "export-pubkey",
   "ui",
   "import-claude-code",
+  "hook",
+  "install-hooks",
+  "init",
+  "validate-receipt",
   "help",
   "--help",
   "-h",
@@ -3867,13 +4039,22 @@ function readStdin(): Promise<string> {
   });
 }
 
+function pkgVersion(): string {
+  try {
+    const p = join(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+    return (JSON.parse(readFileSync(p, "utf8")) as { version?: string }).version ?? "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
+
 async function cliMain(command: string, rest: string[]): Promise<number> {
   if (command === "help" || command === "--help" || command === "-h") {
     printHelp();
     return 0;
   }
   if (command === "--version" || command === "-v") {
-    process.stdout.write("agent-memory-mcp 0.2.0\n");
+    process.stdout.write(`agent-memory-mcp ${pkgVersion()}\n`);
     return 0;
   }
 
@@ -3919,10 +4100,10 @@ async function cliMain(command: string, rest: string[]): Promise<number> {
         const query = positional[0];
         if (!query) throw new Error("Usage: agent-memory relevant <query> [--max N]");
         process.stdout.write(
-          toolRelevantMemories({
+          (await toolRelevantMemories({
             query,
             max: flags.max ? Number(flags.max) : undefined,
-          }) + "\n",
+          })) + "\n",
         );
         return 0;
       }
@@ -4149,6 +4330,29 @@ async function cliMain(command: string, rest: string[]): Promise<number> {
           dryRun: Boolean(flags["dry-run"]),
         });
       }
+      case "hook":
+        return await runHook();
+      case "install-hooks":
+        return installHooks({
+          global: Boolean(flags.global),
+          dryRun: Boolean(flags["dry-run"]),
+        });
+      case "init":
+        return runInit({ force: Boolean(flags.force) });
+      case "validate-receipt": {
+        let receiptStr = flags.receipt ? String(flags.receipt) : "";
+        if (!receiptStr && flags["receipt-file"]) {
+          receiptStr = readFileSync(String(flags["receipt-file"]), "utf8");
+        }
+        if (!receiptStr && flags.stdin) receiptStr = await readStdin();
+        process.stdout.write(
+          toolValidateReceipt({
+            receipt: receiptStr,
+            public_key: flags["public-key"] ?? flags.pubkey,
+          }) + "\n",
+        );
+        return 0;
+      }
       default:
         throw new Error(`Unknown command: ${command}. Try 'agent-memory help'.`);
     }
@@ -4205,6 +4409,16 @@ COMMANDS
                                            Walk ~/.claude/projects/*/memory/ and
                                            import each memory into the current store.
                                            --project filters by substring match.
+  init [--force]                           Install a starter guardrail pack (protect main, block
+                                           rm -rf / prod-data destruction / curl|sh, flag secrets)
+                                           and emit it to every tool. Zero-config protection.
+  install-hooks [--global] [--dry-run]     Wire the enforcement hook into Claude Code's settings so
+                                           hard rules actually BLOCK matching tool calls (soft → ask).
+  hook                                     (internal) PreToolUse hook · reads a proposed tool call on
+                                           stdin and enforces your rules. Registered by install-hooks.
+  validate-receipt --public-key <pem|path> [--receipt <json> | --receipt-file <p> | --stdin]
+                                           Validate another server's CRP 1.1 (Ed25519) receipt —
+                                           the federation primitive (no shared secret).
   help                                     Show this help
   --version                                Print version
 
@@ -4345,6 +4559,389 @@ function importClaudeCode(opts: ImportOptions): number {
     process.stdout.write(`(re-run without --dry-run to actually save)\n`);
   }
   return errors > 0 ? 1 : 0;
+}
+
+// -------------------------------------------------------------
+// Real enforcement · PreToolUse hook (v0.15)
+// -------------------------------------------------------------
+//
+// check_action only gates THIS server's own tools (delete_memory). To enforce
+// your rules on the agent's REAL actions — the shell commands and file writes
+// it runs in Claude Code and compatible hosts — `agent-memory hook` plugs into
+// the host's PreToolUse hook. It reads the proposed tool call on stdin, maps it
+// to an action + category, runs it through your rule store, and answers in the
+// host's hook protocol: a HARD rule denies the call, a SOFT rule asks the user.
+
+interface HookPayload {
+  tool_name?: string;
+  tool_input?: Record<string, unknown>;
+  hook_event_name?: string;
+  cwd?: string;
+  session_id?: string;
+}
+
+/**
+ * Map a proposed host tool call to (action text, action category) for rule
+ * matching. Returns null for tools we never constrain (reads, searches).
+ */
+export function classifyToolCall(
+  toolName: string,
+  input: Record<string, unknown>,
+): { action: string; actionType: string } | null {
+  const t = toolName.toLowerCase();
+  // Shell — the highest-risk surface.
+  if (t === "bash" || t === "shell" || t.includes("terminal") || t.includes("run_command")) {
+    const cmd = String(input.command ?? input.cmd ?? input.script ?? "");
+    if (!cmd.trim()) return null;
+    const lc = cmd.toLowerCase();
+    let actionType = "shell";
+    if (/git\s+push|--force\b|push\s+-f\b|force-with-lease/.test(lc)) actionType = "pushes";
+    else if (
+      /\brm\s|\brmdir\b|\bunlink\b|drop\s+(table|database)|delete\s+from|truncate\b/.test(lc)
+    )
+      actionType = "deletions";
+    else if (/git\s+commit/.test(lc)) actionType = "commits";
+    return { action: cmd, actionType };
+  }
+  // File writes / edits.
+  if (
+    t === "write" ||
+    t === "edit" ||
+    t === "multiedit" ||
+    t === "create_file" ||
+    t.includes("str_replace") ||
+    t.includes("apply_patch")
+  ) {
+    const path = String(input.file_path ?? input.path ?? input.filename ?? "");
+    return { action: `write file ${path}`.trim(), actionType: "file_writes" };
+  }
+  return null; // reads/searches/etc. — unconstrained
+}
+
+/**
+ * PreToolUse hook entry point. Emits the host's structured decision (Claude
+ * Code's `hookSpecificOutput.permissionDecision`) AND uses exit codes (2 =
+ * block) as a fallback for hosts that only honor exit status.
+ */
+async function runHook(): Promise<number> {
+  const raw = await readStdin();
+  let payload: HookPayload = {};
+  try {
+    payload = JSON.parse(raw) as HookPayload;
+  } catch {
+    return 0; // not a JSON hook payload → allow
+  }
+  const toolName = String(payload.tool_name ?? "");
+  const input = (payload.tool_input ?? {}) as Record<string, unknown>;
+  if (!toolName) return 0;
+
+  const classified = classifyToolCall(toolName, input);
+  if (!classified) return 0; // unconstrained tool
+
+  let result: { hard: RuleViolation[]; soft: RuleViolation[]; rules_evaluated: number };
+  try {
+    result = checkActionAgainstRules(classified.action, classified.actionType);
+  } catch {
+    return 0; // never let the hook break the agent
+  }
+
+  if (result.hard.length > 0) {
+    const reason =
+      `Blocked by agent-memory rule(s): ${result.hard.map((v) => v.rule).join(", ")}. ` +
+      `${result.hard[0].reason}. Override requires explicit human action.`;
+    logEvent("hook_deny", {
+      tool: toolName,
+      actionType: classified.actionType,
+      rules: result.hard.map((v) => v.rule),
+    });
+    process.stdout.write(
+      JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: reason,
+        },
+      }) + "\n",
+    );
+    process.stderr.write(reason + "\n");
+    return 2; // fallback hard-block for exit-code-only hosts
+  }
+  if (result.soft.length > 0) {
+    const reason =
+      `agent-memory soft rule(s) flagged this: ${result.soft.map((v) => v.rule).join(", ")}. ` +
+      `Confirm before proceeding.`;
+    logEvent("hook_ask", {
+      tool: toolName,
+      actionType: classified.actionType,
+      rules: result.soft.map((v) => v.rule),
+    });
+    process.stdout.write(
+      JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "ask",
+          permissionDecisionReason: reason,
+        },
+      }) + "\n",
+    );
+    return 0;
+  }
+  return 0; // allowed
+}
+
+/**
+ * Register the PreToolUse hook in Claude Code's settings.json (project-local by
+ * default, or ~/.claude with --global). Idempotent: replaces any prior
+ * agent-memory hook entry. Uses the exact node + script path that's running
+ * this command so the hook resolves regardless of PATH.
+ */
+function installHooks(opts: { global?: boolean; dryRun?: boolean }): number {
+  const dir = opts.global ? join(homedir(), ".claude") : join(process.cwd(), ".claude");
+  const settingsPath = join(dir, "settings.json");
+  const scriptPath = process.argv[1] ? resolve(process.argv[1]) : "agent-memory";
+  const hookCommand = `"${process.execPath}" "${scriptPath}" hook`;
+
+  let settings: Record<string, unknown> = {};
+  if (existsSync(settingsPath)) {
+    try {
+      settings = JSON.parse(readFileSync(settingsPath, "utf8")) as Record<string, unknown>;
+    } catch {
+      process.stderr.write(`error: ${settingsPath} is not valid JSON; refusing to overwrite.\n`);
+      return 1;
+    }
+  }
+  const hooks = (settings.hooks ?? {}) as Record<string, unknown>;
+  const pre = Array.isArray(hooks.PreToolUse)
+    ? (hooks.PreToolUse as Array<Record<string, unknown>>)
+    : [];
+  // Drop any existing agent-memory hook so re-running is idempotent.
+  const cleaned = pre.filter(
+    (m) =>
+      !(Array.isArray(m.hooks) ? (m.hooks as Array<Record<string, unknown>>) : []).some(
+        (h) =>
+          typeof h.command === "string" &&
+          h.command.includes("hook") &&
+          /agent-memory/i.test(h.command),
+      ),
+  );
+  cleaned.push({
+    matcher: "Bash|Write|Edit|MultiEdit",
+    hooks: [{ type: "command", command: hookCommand }],
+  });
+  hooks.PreToolUse = cleaned;
+  settings.hooks = hooks;
+
+  const out = JSON.stringify(settings, null, 2) + "\n";
+  if (opts.dryRun) {
+    process.stdout.write(`would write ${settingsPath}:\n\n${out}\n`);
+    return 0;
+  }
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  atomicWriteFile(settingsPath, out);
+  process.stdout.write(
+    c(ANSI.green, `✓ installed PreToolUse hook`) +
+      `\n  settings : ${settingsPath}\n  guards   : Bash · Write · Edit · MultiEdit\n` +
+      `\nHard rules now BLOCK matching tool calls; soft rules ASK. Restart your agent session to load it.\n` +
+      `Tip: run \`agent-memory init\` to drop in a starter guardrail pack.\n`,
+  );
+  return 0;
+}
+
+// -------------------------------------------------------------
+// init · starter guardrail pack (v0.15)
+// -------------------------------------------------------------
+//
+// Zero-config value: write a handful of sensible hard/soft rules so a new user
+// is protected the moment they install, before writing a single rule of their
+// own. All patterns are ReDoS-safe and scoped to the highest-risk categories.
+
+interface StarterRule {
+  name: string;
+  description: string;
+  severity: "hard" | "soft";
+  enforce_on: string[];
+  matches: string[];
+  content: string;
+}
+
+const STARTER_RULES: StarterRule[] = [
+  {
+    name: "protect-main-branch",
+    description: "Never force-push to main or master.",
+    severity: "hard",
+    enforce_on: ["pushes"],
+    matches: [
+      "push\\s+.*--force.*\\b(main|master)\\b",
+      "push\\s+.*\\b(main|master)\\b.*--force",
+      "push\\s+-f\\b",
+    ],
+    content:
+      "Force-pushing main/master rewrites shared history and can destroy teammates' work.\n\n**Why:** It's almost never what you want from an autonomous agent.\n**How to apply:** Block it; require an explicit human override.",
+  },
+  {
+    name: "no-rm-rf",
+    description: "Block recursive force-deletes (rm -rf).",
+    severity: "hard",
+    enforce_on: ["deletions", "shell"],
+    matches: ["rm\\s+-[a-z]*r[a-z]*f", "rm\\s+-[a-z]*f[a-z]*r"],
+    content:
+      "`rm -rf` is the classic foot-gun — one bad path argument wipes the wrong tree.\n\n**Why:** Irreversible, and agents get paths wrong.\n**How to apply:** Block it; delete specific paths deliberately instead.",
+  },
+  {
+    name: "no-prod-data-destruction",
+    description: "Never drop/truncate tables or mass-delete rows.",
+    severity: "hard",
+    enforce_on: ["deletions", "shell"],
+    matches: ["drop\\s+(table|database)", "truncate\\s+table", "delete\\s+from\\s+\\w+\\s*;"],
+    content:
+      "Schema and bulk-data destruction must be a deliberate, reviewed migration — never an ad-hoc agent action.\n\n**How to apply:** Block; route through a real migration with a human in the loop.",
+  },
+  {
+    name: "no-curl-pipe-shell",
+    description: "Don't pipe network scripts straight into a shell.",
+    severity: "hard",
+    enforce_on: ["shell"],
+    matches: ["(curl|wget)\\s+[^|]*\\|\\s*(sudo\\s+)?(bash|sh|zsh)"],
+    content:
+      "`curl ... | sh` runs unreviewed remote code with your privileges.\n\n**How to apply:** Block; download, read, then run.",
+  },
+  {
+    name: "no-secrets-in-commits",
+    description: "Flag obvious secrets/keys before they're written or committed.",
+    severity: "soft",
+    enforce_on: ["commits", "file_writes"],
+    matches: [
+      "BEGIN\\s+(RSA|EC|OPENSSH|PGP)\\s+PRIVATE\\s+KEY",
+      "AKIA[0-9A-Z]{16}",
+      "sk-[a-zA-Z0-9]{20,}",
+    ],
+    content:
+      "This looks like a real credential.\n\n**How to apply:** Ask before proceeding — confirm it's a placeholder, not a live secret.",
+  },
+];
+
+function toolInit(args: Record<string, unknown>): string {
+  const force = Boolean(args.force);
+  ensureStorage();
+  let added = 0;
+  let skipped = 0;
+  for (const r of STARTER_RULES) {
+    if (!force && existsSync(memoryFilePath(r.name))) {
+      skipped++;
+      continue;
+    }
+    toolSaveRule({
+      name: r.name,
+      description: r.description,
+      content: r.content,
+      severity: r.severity,
+      enforce_on: r.enforce_on,
+      matches: r.matches,
+      scope: ["global"],
+    });
+    added++;
+  }
+  // Surface the rules to every tool immediately.
+  const emit = emitCompanions();
+  return [
+    `✓ starter guardrails installed`,
+    `  added    : ${added}${skipped ? ` · skipped ${skipped} existing (force=true to overwrite)` : ""}`,
+    `  rules    : ${STARTER_RULES.map((r) => r.name).join(", ")}`,
+    `  emitted  : ${emit.emitted.length} companion file(s) → ${emit.outDir}`,
+    ``,
+    `Next: \`agent-memory install-hooks\` so hard rules actually BLOCK matching tool calls in Claude Code.`,
+  ].join("\n");
+}
+
+function runInit(opts: { force?: boolean }): number {
+  process.stdout.write(toolInit({ force: opts.force }) + "\n");
+  return 0;
+}
+
+// -------------------------------------------------------------
+// CRP federation · validate another server's receipt (v0.15)
+// -------------------------------------------------------------
+//
+// CRP 1.1 (Ed25519) makes receipts portable: server A issues "delete X",
+// server B validates with A's PUBLIC key — no shared secret. This is the
+// primitive that turns Compliance Receipts from a feature into a standard.
+
+/**
+ * Validate a CRP 1.1 (Ed25519) receipt against a supplied public key (PEM).
+ * Skips the rules-version check by default (the issuer's rule set is foreign);
+ * verifies signature, expiry, and any required caveats.
+ */
+export function validateReceiptWithPublicKey(
+  receipt: ComplianceReceipt,
+  publicKeyPem: string,
+  opts: { required_caveats?: Caveat[]; check_expiry?: boolean } = {},
+): ValidateReceiptResult {
+  if (receipt.version !== "1.1") {
+    return { valid: false, reason: "federation requires a CRP 1.1 (Ed25519) receipt" };
+  }
+  const canonical = canonicalizeReceipt({
+    id: receipt.id,
+    issued_at: receipt.issued_at,
+    expires_at: receipt.expires_at,
+    rules_version: receipt.rules_version,
+    caveats: receipt.caveats,
+    version: receipt.version,
+  });
+  let ok = false;
+  try {
+    ok = cryptoVerify(
+      null,
+      Buffer.from(canonical, "utf8"),
+      createPublicKey(publicKeyPem),
+      Buffer.from(receipt.signature, "hex"),
+    );
+  } catch {
+    return { valid: false, reason: "signature verification failed (bad key or receipt)" };
+  }
+  if (!ok) return { valid: false, reason: "invalid signature for the supplied public key" };
+  if (opts.check_expiry !== false && Math.floor(Date.now() / 1000) > receipt.expires_at) {
+    return { valid: false, reason: "receipt expired" };
+  }
+  for (const required of opts.required_caveats ?? []) {
+    if (!receipt.caveats.find((cv) => cv.type === required.type && cv.value === required.value)) {
+      return {
+        valid: false,
+        reason: `missing required caveat: ${required.type}=${required.value}`,
+      };
+    }
+  }
+  return { valid: true };
+}
+
+function readPublicKeyArg(arg: unknown): string | null {
+  if (typeof arg !== "string" || !arg.trim()) return null;
+  const v = arg.trim();
+  if (v.includes("BEGIN PUBLIC KEY")) return v; // inline PEM
+  if (existsSync(v)) {
+    try {
+      return readFileSync(v, "utf8");
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function toolValidateReceipt(args: Record<string, unknown>): string {
+  const receipt = parseReceiptArg(args.receipt);
+  if (!receipt) throw new Error("receipt required (object or JSON string)");
+  const pem = readPublicKeyArg(args.public_key ?? args.pubkey);
+  if (!pem) {
+    throw new Error(
+      "public_key required · pass the issuer's Ed25519 public key as inline PEM or a file path " +
+        "(get yours with `agent-memory export-pubkey`).",
+    );
+  }
+  const required = Array.isArray(args.required_caveats)
+    ? (args.required_caveats as Caveat[])
+    : undefined;
+  const v = validateReceiptWithPublicKey(receipt, pem, { required_caveats: required });
+  return JSON.stringify({ valid: v.valid, reason: v.reason }, null, 2);
 }
 
 // -------------------------------------------------------------

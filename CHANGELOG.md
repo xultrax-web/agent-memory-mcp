@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.15.0 — Real enforcement, zero-config guardrails, semantic recall
+
+### Added
+
+- **Real enforcement via host hooks.** `agent-memory hook` plugs into Claude
+  Code's `PreToolUse` hook: it maps the agent's proposed Bash command / file
+  write to a rule category and **denies** the call on a hard-rule match (**asks**
+  on soft). `agent-memory install-hooks` wires it into `settings.json` (project
+  or `--global`), idempotently. Rules now enforce on the agent's REAL actions,
+  not just the server's own `delete_memory`.
+- **`agent-memory init`** (and the `init` tool) — a starter guardrail pack
+  (protect main, no `rm -rf`, no prod-data destruction, no `curl|sh`, flag
+  secrets) emitted to every tool. Zero-config protection on first install.
+- **Semantic recall (opt-in).** Set `AGENT_MEMORY_EMBED_MODEL` (optional
+  `AGENT_MEMORY_EMBED_URL`, default local Ollama) and `relevant_memories` ranks
+  by embedding cosine similarity, cached on disk per (model, content-hash).
+  Falls back silently to lexical when unset or unreachable.
+- **CRP federation.** `validate_receipt` tool + `agent-memory validate-receipt`
+  CLI validate ANOTHER server's CRP 1.1 (Ed25519) receipt with its public key —
+  no shared secret. The primitive that makes Compliance Receipts a standard.
+- One-click install: `smithery.yaml` + a Cursor "Add to Cursor" deeplink badge.
+
+### Improved
+
+- **Better default recall.** `relevant_memories` blends Fuse with query/body
+  token overlap, so reworded queries that share keywords surface results Fuse
+  alone returned nothing for.
+- `--version` now reports the real package version (was hard-coded `0.2.0`).
+
 ## 0.14.0 — Security hardening
 
 ### Security

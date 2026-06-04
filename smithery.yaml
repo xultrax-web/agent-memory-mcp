@@ -1,0 +1,25 @@
+# Smithery configuration · https://smithery.ai/docs
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    properties:
+      AGENT_MEMORY_SCOPE:
+        type: string
+        description: "Set to 'global' for a shared store at ~/.agent-memory/ instead of the per-project ./.agent-memory/."
+      AGENT_MEMORY_DIR:
+        type: string
+        description: "Absolute path to a custom memory directory (overrides the default location)."
+      AGENT_MEMORY_EMBED_MODEL:
+        type: string
+        description: "Optional. Embedding model name (e.g. nomic-embed-text) to enable semantic recall via a local Ollama endpoint."
+  commandFunction: |-
+    (config) => ({
+      command: 'npx',
+      args: ['-y', '@xultrax-web/agent-memory-mcp'],
+      env: {
+        ...(config.AGENT_MEMORY_SCOPE ? { AGENT_MEMORY_SCOPE: config.AGENT_MEMORY_SCOPE } : {}),
+        ...(config.AGENT_MEMORY_DIR ? { AGENT_MEMORY_DIR: config.AGENT_MEMORY_DIR } : {}),
+        ...(config.AGENT_MEMORY_EMBED_MODEL ? { AGENT_MEMORY_EMBED_MODEL: config.AGENT_MEMORY_EMBED_MODEL } : {}),
+      },
+    })

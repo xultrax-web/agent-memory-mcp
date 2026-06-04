@@ -7,6 +7,9 @@
 [![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](https://nodejs.org)
 [![MCP](https://img.shields.io/badge/MCP-server-blueviolet)](https://modelcontextprotocol.io)
 
+[![Add to Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](cursor://anysphere.cursor-deeplink/mcp/install?name=agent-memory&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkB4dWx0cmF4LXdlYi9hZ2VudC1tZW1vcnktbWNwIl19)
+[![Install on Smithery](https://smithery.ai/badge/@xultrax-web/agent-memory-mcp)](https://smithery.ai/server/@xultrax-web/agent-memory-mcp)
+
 <!-- 30-second demo: drop the clip here once recorded → ![agent-memory-mcp blocking a destructive action](docs/demo.gif) -->
 
 Your AI coding agent will eventually try to `rm -rf` the wrong folder, force-push to `main`, or delete the file you actually needed. **agent-memory-mcp** is the memory layer where you write the rule **once**, in plain markdown — and it _enforces itself_:
@@ -16,6 +19,16 @@ Your AI coding agent will eventually try to `rm -rf` the wrong folder, force-pus
 - **Plain files you own.** `cat` it, `grep` it, edit it in vim, commit it to git, sync it across machines with `agent-memory sync`. No database, no daemon, no cloud — and if the AI gets it wrong, you fix it in a text editor.
 
 Memory — the rules, recipes, decisions, and context that survive every session and every tool — is the substrate. **Enforcement is the point.** Reference implementation of the [Compliance Receipt Protocol 1.0](docs/compliance-receipt-protocol-1.0.md), so other MCP servers can adopt the same receipts and interoperate.
+
+## Quickstart · guarded in 60 seconds
+
+```bash
+# After adding the server to your MCP client (see Install below), from your project:
+agent-memory init            # drop in a starter guardrail pack (protect main, no rm -rf, no prod-data destruction, …)
+agent-memory install-hooks   # make hard rules actually BLOCK in Claude Code (soft rules → ask)
+```
+
+Your agent is now guarded across every tool. Write your own rules with `save_rule` — they enforce _and_ emit to `AGENTS.md` / `CLAUDE.md` / `.cursor/rules` / `.gemini`. (CLI commands assume a global install — `npm i -g @xultrax-web/agent-memory-mcp` — or prefix with `npx -y`.)
 
 ---
 
@@ -72,6 +85,8 @@ MCP shape:
 **Tier 1** (deterministic, every client): action matched against `rule.matches` regex, filtered by `rule.enforce_on`. Hard violations block. Soft violations warn. Approved actions get a fresh receipt with 60s TTL.
 
 **Tier 2** (Sampling-enriched, shipped v0.11.7): for rules with `applies_when` natural-language conditions, the server uses MCP Sampling to ask the client's LLM whether the proposed action triggers the rule. Falls back to Tier 1 only if the client doesn't advertise Sampling capability. Works on Claude Desktop and VS Code Copilot; on Claude Code, Cursor, Cline, and Codex CLI you get Tier 1 only — which is enough to enforce the rules you've written.
+
+But `check_action` only gates _this server's own_ tools. To enforce your rules on the agent's **real** actions — the shell commands and file writes it runs — **`agent-memory install-hooks`** wires a `PreToolUse` hook into Claude Code: a **hard** rule **denies** the matching tool call, a **soft** rule **asks** you. Now an `rm -rf` or a force-push to `main` is actually _blocked_, not just advised. Run `agent-memory init` first for a starter ruleset.
 
 ### 3. Compliance Receipts · the cryptographic primitive
 
@@ -333,6 +348,8 @@ Custom path:
 | `check_action`      | **v0.11.3+.** Tier-1 deterministic + Tier-2 Sampling rule check. Returns `{approved, hard_violations, soft_warnings, receipt?}`. The protocol enforcement point.                                                                                                              |
 | `audit`             | **v0.11.4+.** Operational health for the rule store: stale rules, pattern conflicts, recent denials, unreceipted destructive ops. Returns JSON or pretty-prints.                                                                                                              |
 | `rotate_key`        | **v0.14+.** Rotate the receipt-signing HMAC / Ed25519 keys, invalidating every outstanding receipt. Remediation after a key leak. Optional `mode`: `hmac` \| `ed25519` \| `both`.                                                                                             |
+| `init`              | **v0.15+.** Install a starter guardrail pack (protect main, no rm -rf, no prod-data destruction, no curl\|sh, flag secrets) and emit it to every tool. `force=true` overwrites.                                                                                               |
+| `validate_receipt`  | **v0.15+.** Validate ANOTHER server's CRP 1.1 (Ed25519) receipt with its public key · the federation primitive. Pass `receipt` + `public_key` (inline PEM or a file path).                                                                                                    |
 
 ### Prompts
 
