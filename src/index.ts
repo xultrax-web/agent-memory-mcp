@@ -52,6 +52,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   statSync,
   writeFileSync,
@@ -4962,8 +4963,20 @@ async function main(): Promise<void> {
 }
 
 // Only auto-run main() when invoked directly. Importing this file
-// (e.g. from src/tui.tsx) should not trigger the dispatch.
-const isEntryPoint = process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url);
+// (e.g. from src/tui.tsx) should not trigger the dispatch. Resolve symlinks on
+// both sides first: when installed globally, process.argv[1] is the bin SYMLINK
+// path while import.meta.url is the real file, so a raw string compare wrongly
+// returns false and main() never runs — the CLI and MCP server silently no-op.
+function resolvePathSafe(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+const isEntryPoint =
+  !!process.argv[1] &&
+  resolvePathSafe(process.argv[1]) === resolvePathSafe(fileURLToPath(import.meta.url));
 if (isEntryPoint) {
   main().catch((err) => {
     process.stderr.write(`Fatal: ${err instanceof Error ? err.message : String(err)}\n`);
