@@ -3756,7 +3756,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "array",
             items: { type: "string" },
             description:
-              "Where this rule applies. Examples: ['global'], ['project:prefixcheck'], ['tool:git'].",
+              "Where this rule applies. Examples: ['global'], ['project:my-app'], ['tool:git'].",
           },
           applies_when: {
             type: "array",

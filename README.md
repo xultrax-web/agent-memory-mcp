@@ -498,13 +498,13 @@ If you've been using Claude Code's built-in memory, bring it over:
 agent-memory import-claude-code --dry-run
 
 # Filter to one project by substring match (case-insensitive)
-agent-memory import-claude-code --project prefixcheck --dry-run
+agent-memory import-claude-code --project my-app --dry-run
 
 # Do the import
-agent-memory import-claude-code --project prefixcheck
+agent-memory import-claude-code --project my-app
 
 # Replace existing memories with the same names
-agent-memory import-claude-code --project prefixcheck --overwrite
+agent-memory import-claude-code --project my-app --overwrite
 ```
 
 The importer walks `~/.claude/projects/*/memory/`, parses each memory's YAML frontmatter (tolerantly — malformed files don't kill the run), flattens Claude Code's `metadata.type` field to top-level `type`, and writes to your current store. Existing memories with the same name are skipped unless you pass `--overwrite`.
@@ -667,6 +667,6 @@ MIT. Use it for whatever.
 
 ## Author
 
-[@xultrax-web](https://github.com/xultrax-web) · built for the cross-client memory problem I kept running into. Part of [PrefixCheck Labs](https://prefixcheck.com/labs/).
+[@xultrax-web](https://github.com/xultrax-web) · built for the cross-client memory problem I kept running into. Part of [Peach & Madison Design](https://peachandmadison.com).
 
 Inspired by the file-based memory system in Anthropic's Claude Code.
